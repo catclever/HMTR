@@ -1,0 +1,695 @@
+module TrainStage1
+
+using Lux
+using Random
+using JLD2
+using Optimisers
+using Zygote
+using Printf
+using NNlib
+using CUDA
+using LuxCUDA
+using Dates
+using ..Utils
+using ..Model
+
+export train_stage1
+
+const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
+const DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
+const DATA_FILE = get(ENV, "DATA_FILE", joinpath(DATA_DIR, "processed.jld2"))
+const META_FILE = get(ENV, "META_FILE", "")
+const CHECKPOINT_DIR = get(ENV, "CHECKPOINT_DIR", joinpath(PROJECT_ROOT, "checkpoints"))
+const CHECKPOINT_PREFIX = get(ENV, "CHECKPOINT_PREFIX", "ckpt_stage1")
+const EPOCHS = parse(Int, get(ENV, "EPOCHS", "5"))
+const BATCH_SIZE = parse(Int, get(ENV, "BATCH_SIZE", "32"))
+const LR = parse(Float64, get(ENV, "LR", "1e-3"))
+const MAX_BATCHES = parse(Int, get(ENV, "MAX_BATCHES", "0"))
+const SAVE_EVERY = parse(Int, get(ENV, "SAVE_EVERY", "0"))
+const ADD_TIMESTAMP = parse(Int, get(ENV, "ADD_TIMESTAMP", "1"))
+const GRAD_CLIP_NORM = parse(Float64, get(ENV, "GRAD_CLIP_NORM", "5.0"))
+const LOSS_SPIKE_THRESHOLD = parse(Float64, get(ENV, "LOSS_SPIKE_THRESHOLD", "10.0"))
+const SKIP_ON_SPIKE = parse(Int, get(ENV, "SKIP_ON_SPIKE", "1"))
+const WARMUP_STEPS = parse(Int, get(ENV, "WARMUP_STEPS", "500"))
+
+const PRETRAIN_EMB_FILE = get(ENV, "PRETRAIN_EMB_FILE", "")
+const INSPECT_DATA = parse(Int, get(ENV, "INSPECT_DATA", "0"))
+const INSPECT_N = parse(Int, get(ENV, "INSPECT_N", "3"))
+const INSPECT_SEED = parse(Int, get(ENV, "INSPECT_SEED", "42"))
+const MODEL_DIM = parse(Int, get(ENV, "MODEL_DIM", "256"))
+const DTYPE = get(ENV, "DTYPE", "fp32")
+const ENCODER_DTYPE = get(ENV, "ENCODER_DTYPE", "")
+const NORM_DTYPE = get(ENV, "NORM_DTYPE", "")
+const DECODER_DTYPE = get(ENV, "DECODER_DTYPE", "")
+const RESUME_CKPT = get(ENV, "RESUME_CKPT", "")
+
+function parse_ckpt_epoch_step(path::AbstractString)
+    base = basename(path)
+    m = match(r"_epoch(\d+)(?:_step(\d+))?\.jld2$", base)
+    if m === nothing
+        return 0, 0
+    end
+    epoch = parse(Int, m.captures[1])
+    step = m.captures[2] === nothing ? 0 : parse(Int, m.captures[2])
+    return epoch, step
+end
+
+function infer_ckpt_prefix(path::AbstractString)
+    base = basename(path)
+    if endswith(base, ".jld2")
+        base = base[1:end - 5]
+    end
+    m = match(r"^(.*)_epoch\d+(?:_step\d+)?$", base)
+    return m === nothing ? base : m.captures[1]
+end
+
+function resolve_config(cli::Dict{Symbol, Any})
+    data_file = get(cli, :data_file, DATA_FILE)
+    if !isabspath(data_file)
+        if !isfile(data_file) && isfile(joinpath(DATA_DIR, data_file))
+            data_file = joinpath(DATA_DIR, data_file)
+        end
+    end
+    meta_file = string(get(cli, :meta_file, META_FILE))
+    if isempty(meta_file)
+        if endswith(data_file, ".jld2")
+            meta_file = data_file[1:end - 5] * "_meta.jld2"
+        else
+            meta_file = data_file * "_meta.jld2"
+        end
+    end
+    if !isabspath(meta_file) && !isempty(meta_file)
+        if !isfile(meta_file) && isfile(joinpath(DATA_DIR, meta_file))
+            meta_file = joinpath(DATA_DIR, meta_file)
+        end
+    end
+    checkpoint_dir = get(cli, :checkpoint_dir, CHECKPOINT_DIR)
+    checkpoint_prefix = get(cli, :checkpoint_prefix, CHECKPOINT_PREFIX)
+    epochs = parse(Int, string(get(cli, :epochs, EPOCHS)))
+    batch_size = parse(Int, string(get(cli, :batch_size, BATCH_SIZE)))
+    dim = parse(Int, string(get(cli, :dim, MODEL_DIM)))
+    lr = parse(Float64, string(get(cli, :lr, LR)))
+    max_batches = parse(Int, string(get(cli, :max_batches, MAX_BATCHES)))
+    save_every = parse(Int, string(get(cli, :save_every, SAVE_EVERY)))
+    add_timestamp = parse(Int, string(get(cli, :add_timestamp, ADD_TIMESTAMP))) != 0 || (string(get(cli, :timestamp, "false")) == "true")
+    grad_clip_norm = parse(Float64, string(get(cli, :grad_clip_norm, GRAD_CLIP_NORM)))
+    loss_spike_threshold = parse(Float64, string(get(cli, :loss_spike_threshold, LOSS_SPIKE_THRESHOLD)))
+    skip_on_spike = parse(Int, string(get(cli, :skip_on_spike, SKIP_ON_SPIKE))) != 0 || (string(get(cli, :skip_spike, "false")) == "true")
+    pretrain_emb_file = get(cli, :pretrain_emb_file, PRETRAIN_EMB_FILE)
+    inspect_data = parse(Int, string(get(cli, :inspect_data, INSPECT_DATA))) != 0 || (string(get(cli, :inspect, "false")) == "true")
+    inspect_n = parse(Int, string(get(cli, :inspect_n, INSPECT_N)))
+    warmup_steps = parse(Int, string(get(cli, :warmup_steps, WARMUP_STEPS)))
+    inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
+    dtype = string(get(cli, :dtype, DTYPE))
+    encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
+    norm_dtype = string(get(cli, :norm_dtype, NORM_DTYPE))
+    decoder_dtype = string(get(cli, :decoder_dtype, DECODER_DTYPE))
+
+    resume_ckpt = string(get(cli, :resume_ckpt, get(cli, :resume, get(cli, :resume_from, RESUME_CKPT))))
+    if resume_ckpt == "true"
+        resume_ckpt = ""
+    end
+    
+    # Smart path resolution:
+    # 1. Check if path exists as-is (absolute or relative to CWD)
+    # 2. If not, try relative to checkpoint_dir
+    if !isempty(resume_ckpt) && !isfile(resume_ckpt)
+        alt_path = joinpath(checkpoint_dir, basename(resume_ckpt))
+        if isfile(alt_path)
+            resume_ckpt = alt_path
+        elseif isfile(joinpath(checkpoint_dir, resume_ckpt))
+             resume_ckpt = joinpath(checkpoint_dir, resume_ckpt)
+        end
+    end
+
+    resume_epoch, resume_step = isempty(resume_ckpt) ? (0, 0) : parse_ckpt_epoch_step(resume_ckpt)
+
+    prefix_explicit = haskey(cli, :checkpoint_prefix) || haskey(ENV, "CHECKPOINT_PREFIX")
+    timestamp_explicit = haskey(cli, :add_timestamp) || haskey(cli, :timestamp) || haskey(ENV, "ADD_TIMESTAMP")
+    if !isempty(resume_ckpt) && !prefix_explicit
+        checkpoint_prefix = infer_ckpt_prefix(resume_ckpt)
+        prefix_explicit = true
+    end
+    if !isempty(resume_ckpt) && !timestamp_explicit
+        add_timestamp = false
+    end
+
+    if dim != MODEL_DIM && !occursin("_d$(dim)", checkpoint_prefix)
+        checkpoint_prefix = "$(checkpoint_prefix)_d$(dim)"
+    end
+
+    if !prefix_explicit || add_timestamp
+        ts = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
+        checkpoint_prefix = "$(checkpoint_prefix)_$(ts)"
+    end
+
+    return (;
+        data_file,
+        meta_file,
+        checkpoint_dir,
+        checkpoint_prefix,
+        epochs,
+        batch_size,
+        dim,
+        lr,
+        max_batches,
+        save_every,
+        grad_clip_norm,
+        loss_spike_threshold,
+        skip_on_spike,
+        pretrain_emb_file,
+        resume_ckpt,
+        resume_epoch,
+        resume_step,
+        inspect_data,
+        inspect_n,
+        inspect_seed,
+        dtype,
+        encoder_dtype,
+        norm_dtype,
+        decoder_dtype,
+        warmup_steps,
+    )
+end
+
+function tree_sumabs2(x)
+    if x === nothing
+        return 0f0
+    elseif x isa NamedTuple
+        s = 0f0
+        for v in values(x)
+            s += tree_sumabs2(v)
+        end
+        return s
+    elseif x isa Tuple
+        s = 0f0
+        for v in x
+            s += tree_sumabs2(v)
+        end
+        return s
+    elseif x isa AbstractArray
+        return Float32(sum(abs2, x))
+    elseif x isa Number
+        return Float32(abs2(x))
+    else
+        return 0f0
+    end
+end
+
+function tree_map(f, x)
+    if x === nothing
+        return nothing
+    elseif x isa NamedTuple
+        ks = keys(x)
+        vs = map(v -> tree_map(f, v), Tuple(values(x)))
+        return NamedTuple{ks}(vs)
+    elseif x isa Tuple
+        return map(v -> tree_map(f, v), x)
+    else
+        return f(x)
+    end
+end
+
+function parse_dtype(s::AbstractString)
+    v = lowercase(strip(String(s)))
+    if v in ("", "default")
+        return nothing
+    elseif v in ("fp32", "float32", "f32")
+        return Float32
+    elseif v in ("fp16", "float16", "f16")
+        return Float16
+    elseif v in ("bf16", "bfloat16")
+        return Core.BFloat16
+    else
+        error("Unknown dtype=$(s). Supported: fp32, fp16, bf16")
+    end
+end
+
+function cast_floats(x, T::Type)
+    return tree_map(v -> (v isa AbstractArray && eltype(v) <: AbstractFloat && eltype(v) != T) ? T.(v) : v, x)
+end
+
+function apply_precision(ps, st, cfg)
+    T_global = something(parse_dtype(cfg.dtype), Float32)
+    T_enc = something(parse_dtype(cfg.encoder_dtype), T_global)
+    T_norm = something(parse_dtype(cfg.norm_dtype), T_global)
+    T_dec = something(parse_dtype(cfg.decoder_dtype), T_global)
+
+    ps2 = merge(ps, (;
+        encoder = cast_floats(ps.encoder, T_enc),
+        norm = cast_floats(ps.norm, T_norm),
+        decoder = cast_floats(ps.decoder, T_dec),
+    ))
+
+    st2 = st
+    if haskey(st, :encoder) && haskey(st, :norm) && haskey(st, :decoder)
+        st2 = merge(st, (;
+            encoder = cast_floats(st.encoder, T_enc),
+            norm = cast_floats(st.norm, T_norm),
+            decoder = cast_floats(st.decoder, T_dec),
+        ))
+    end
+
+    return ps2, st2, (; global_dtype=T_global, encoder=T_enc, norm=T_norm, decoder=T_dec)
+end
+
+function clip_grads(grads, max_norm::Float32)
+    if !(max_norm > 0f0)
+        return grads, 0f0, 1f0
+    end
+    s = tree_sumabs2(grads)
+    norm = sqrt(s)
+    if !isfinite(norm)
+        zeroed = tree_map(g -> (g isa AbstractArray || g isa Number) ? (g .* 0f0) : g, grads)
+        return zeroed, norm, 0f0
+    end
+    if !(norm > max_norm)
+        return grads, norm, 1f0
+    end
+    scale = max_norm / (norm + 1f-6)
+    clipped = tree_map(g -> (g isa AbstractArray || g isa Number) ? (g .* scale) : g, grads)
+    return clipped, norm, scale
+end
+
+function batch_stats(x_batch, vocab_size::Int, pad_id::Int, eos_id::Int)
+    x_min = Int(minimum(x_batch))
+    x_max = Int(maximum(x_batch))
+    n_total = length(x_batch)
+    n_pad = Int(sum(x_batch .== pad_id))
+    n_eos = Int(sum(x_batch .== eos_id))
+    return (; x_min, x_max, n_total, n_pad, n_eos)
+end
+
+function logsoftmax_stable(x; dims::Int)
+    m = maximum(x; dims=dims)
+    y = x .- m
+    lse = log.(sum(exp.(y); dims=dims))
+    return y .- lse
+end
+
+function load_data(data_file::AbstractString, meta_file::AbstractString)
+    if !isfile(data_file)
+        error("Data file $(data_file) not found!")
+    end
+    data = JLD2.load(data_file)
+    matrix = data["data"]
+    
+    meta_src = if isfile(meta_file)
+        JLD2.load(meta_file)
+    else
+        data
+    end
+    params = meta_src["params"]
+    char_map = get(meta_src, "char_map", Dict{Any, Any}())
+    vocab = get(meta_src, "vocab", nothing)
+    
+    block_size = params["BLOCK_SIZE"]
+    vocab_size = if haskey(params, "VOCAB_SIZE")
+        params["VOCAB_SIZE"]
+    elseif !isempty(char_map)
+        length(char_map) + 3
+    elseif vocab !== nothing
+        length(vocab) - 1
+    else
+        maximum(matrix)
+    end
+    pad_id = params["PAD"]
+    eos_id = params["EOS"]
+    
+    return matrix, vocab_size, block_size, pad_id, eos_id, vocab
+end
+
+function decode_ids(ids::AbstractVector{Int}, vocab, pad_id::Int, eos_id::Int)
+    vocab === nothing && return ""
+    io = IOBuffer()
+    for tid in ids
+        if tid == eos_id
+            break
+        elseif tid == pad_id
+            continue
+        end
+        idx = tid + 1
+        if 1 <= idx <= length(vocab)
+            write(io, string(vocab[idx]))
+        else
+            write(io, "<?>")
+        end
+    end
+    return String(take!(io))
+end
+
+function print_training_samples(x::AbstractMatrix{Int}, vocab, pad_id::Int, eos_id::Int; n::Int=3)
+    n_show = min(n, size(x, 2))
+    for col in 1:n_show
+        ids = vec(x[:, col])
+        eos_pos = findfirst(==(eos_id), ids)
+        pad_pos = findfirst(==(pad_id), ids)
+        pad_tail = pad_pos === nothing ? false : all(==(pad_id), view(ids, pad_pos:length(ids)))
+        eos_after_pad = pad_pos === nothing ? false : any(==(eos_id), view(ids, pad_pos:length(ids)))
+        println("Sample $(col) | eos_pos=$(something(eos_pos, 0)) | pad_pos=$(something(pad_pos, 0)) | pad_tail=$(pad_tail) | eos_after_pad=$(eos_after_pad)")
+        print(" ids: ")
+        show(stdout, ids)
+        println()
+        s = decode_ids(ids, vocab, pad_id, eos_id)
+        if !isempty(s)
+            println(" text: ", s)
+        end
+    end
+    return
+end
+
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int)
+    capsules, st_enc = model.encoder(x_batch, ps.encoder, st.encoder)
+    capsules_norm, st_norm = model.norm(capsules, ps.norm, st.norm)
+    y_pred, st_dec = model.decoder(capsules_norm, y_batch, ps.decoder, st.decoder; start_id=start_id)
+    st_new = (encoder=st_enc, norm=st_norm, decoder=st_dec)
+    
+    vocab_size = size(y_pred, 1)
+    y_pred_flat = reshape(y_pred, vocab_size, :)
+    y_batch_flat = reshape(y_batch, :)
+
+    logits = eltype(y_pred_flat) <: Union{Float16, Core.BFloat16} ? Float32.(y_pred_flat) : y_pred_flat
+    log_probs = logsoftmax_stable(logits; dims=1)
+    mask = y_batch_flat .!= pad_id
+    denom = max(Float32(sum(mask)), 1f0)
+    weights = Float32.(mask)
+
+    lin = y_batch_flat .+ (eachindex(y_batch_flat) .- 1) .* vocab_size
+    picked = log_probs[lin]
+    loss = -(sum(picked .* weights) / denom)
+    
+    return loss, st_new, (;)
+end
+
+function select_device()
+    return CUDA.functional() ? gpu_device() : cpu_device()
+end
+
+function maybe_load_pretrained_embedding!(ps, vocab_size::Int, dim::Int, pretrain_emb_file::AbstractString)
+    if isempty(pretrain_emb_file)
+        return
+    end
+
+    if !isfile(pretrain_emb_file)
+        error("PRETRAIN_EMB_FILE=$(pretrain_emb_file) not found")
+    end
+
+    d = JLD2.load(pretrain_emb_file)
+    W = if haskey(d, "embedding")
+        d["embedding"]
+    elseif haskey(d, "W")
+        d["W"]
+    else
+        error("Pretrained embedding file must contain key \"embedding\" or \"W\"")
+    end
+
+    W = Array(W)
+    if size(W) == (vocab_size, dim)
+        W = permutedims(W)
+    end
+
+    if size(W) != (dim, vocab_size)
+        error("Embedding shape must be (dim, vocab_size) or (vocab_size, dim). Got $(size(W)). Expected dim=$dim vocab_size=$vocab_size")
+    end
+
+    T = eltype(ps.encoder.embedding.weight)
+    ps.encoder.embedding.weight .= T.(W)
+    return
+end
+
+# LR Scheduler: Warmup + Cosine Decay
+function get_lr(step::Int, warmup_steps::Int, max_lr::Float64, total_steps::Int)
+    if step <= warmup_steps
+        return max_lr * (step / max(1.0, Float64(warmup_steps)))
+    else
+        # Avoid division by zero if total_steps <= warmup_steps
+        if total_steps <= warmup_steps
+            return max_lr * 0.1 # Fallback
+        end
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        progress = clamp(progress, 0.0, 1.0)
+        return max_lr * 0.5 * (1 + cos(π * progress))
+    end
+end
+
+"""
+    get_target_lr(base_lr)
+
+Returns the target max learning rate.
+You can edit this function body during training (e.g. change to `return 1e-4`)
+and Revise.jl will hot-reload it, allowing dynamic LR adjustment.
+"""
+@noinline function get_target_lr(base_lr::Float64)
+    # Default behavior: use the configured LR.
+    # To adjust dynamically: replace `return base_lr` with `return 2e-4` (or any value) and save the file.
+    val = base_lr*4
+    # println("DEBUG: get_target_lr($base_lr) -> $val") # Commented out to avoid spam, uncomment to debug
+    return val
+end
+
+function train(cfg)
+    mkpath(cfg.checkpoint_dir)
+    
+    dev = select_device()
+    cpu = cpu_device()
+    println("Using device: $dev")
+    flush(stdout)
+    
+    raw_data, vocab_size, block_size, pad_id, eos_id, vocab = load_data(cfg.data_file, cfg.meta_file)
+    N_total = size(raw_data, 2)
+    println("Loaded data. Total samples: $N_total, Vocab: $vocab_size")
+    flush(stdout)
+    
+    rng = Random.default_rng()
+    Random.seed!(rng, 42)
+    
+    model = HMTR_Stage1_AutoEncoder(vocab_size, cfg.dim, block_size; pad_id=pad_id, eos_id=eos_id)
+    ps0, st0 = Lux.setup(rng, model)
+    ps = ps0
+    st = st0
+
+    resume_opt_state = nothing
+    train_step = 0
+    if !isempty(cfg.resume_ckpt)
+        if !isfile(cfg.resume_ckpt)
+            error("resume_ckpt=$(cfg.resume_ckpt) not found")
+        end
+        ckpt = JLD2.load(cfg.resume_ckpt)
+        ps = ckpt["ps"]
+        st = ckpt["st"]
+        if haskey(ckpt, "opt_state")
+            resume_opt_state = ckpt["opt_state"]
+        end
+        if haskey(ckpt, "train_step")
+            train_step = Int(ckpt["train_step"])
+        end
+
+        if !haskey(ps, :norm)
+            ps = merge(ps, (norm=ps0.norm,))
+        end
+        if !haskey(st, :norm)
+            st = merge(st, (norm=st0.norm,))
+        end
+
+        println("Resuming from ckpt=$(cfg.resume_ckpt) epoch=$(cfg.resume_epoch) step=$(cfg.resume_step) train_step=$(train_step)")
+    else
+        maybe_load_pretrained_embedding!(ps, vocab_size, cfg.dim, cfg.pretrain_emb_file)
+    end
+
+    ps, st, dtypes = apply_precision(ps, st, cfg)
+    println("Precision | global=$(dtypes.global_dtype) encoder=$(dtypes.encoder) norm=$(dtypes.norm) decoder=$(dtypes.decoder)")
+
+    ps = ps |> dev
+    st = st |> dev
+    
+    opt = Optimisers.Adam(cfg.lr)
+    opt_state = Optimisers.setup(opt, ps)
+    if resume_opt_state !== nothing
+        opt_state = resume_opt_state |> dev
+    end
+    
+    start_id = eos_id
+    
+    num_batches = div(N_total, cfg.batch_size)
+    if cfg.max_batches > 0
+        num_batches = min(num_batches, cfg.max_batches)
+    end
+    
+    # Scheduler Setup
+    warmup_steps = cfg.warmup_steps
+    total_steps = cfg.epochs * num_batches
+    println("Training Plan: $total_steps total steps, $warmup_steps warmup steps.")
+    flush(stdout)
+    
+    epoch_start = 1
+    resume_shuffles = 0
+    if !isempty(cfg.resume_ckpt) && cfg.resume_epoch > 0
+        if cfg.resume_step > 0
+            epoch_start = cfg.resume_epoch
+            resume_shuffles = max(cfg.resume_epoch - 1, 0)
+        else
+            epoch_start = cfg.resume_epoch + 1
+            resume_shuffles = cfg.resume_epoch
+        end
+    end
+    
+    println("DEBUG: epoch_start=$epoch_start, resume_shuffles=$resume_shuffles")
+    flush(stdout)
+
+    if resume_shuffles > 0
+        println("DEBUG: Entering shuffle loop for $resume_shuffles iterations")
+        flush(stdout)
+        for i in 1:resume_shuffles
+            println("DEBUG: Shuffle iteration $i")
+            flush(stdout)
+            shuffle(rng, 1:N_total)
+        end
+        println("DEBUG: Finished shuffle loop")
+        flush(stdout)
+    end
+
+    # Train loop
+    println("Starting training loop... (First batch may take time to compile)")
+    flush(stdout)
+
+    for epoch in epoch_start:cfg.epochs
+        total_loss = 0.0
+        n_updates = 0
+        
+        # Shuffle
+        indices = shuffle(rng, 1:N_total)
+        
+        step_start = 1
+        if !isempty(cfg.resume_ckpt) && epoch == cfg.resume_epoch && cfg.resume_step > 0
+            step_start = min(cfg.resume_step + 1, num_batches + 1)
+        end
+
+        @time for i in step_start:num_batches
+            # Update LR
+            target_lr = get_target_lr(cfg.lr)
+            current_lr = get_lr(train_step + 1, warmup_steps, target_lr, total_steps)
+            Optimisers.adjust!(opt_state, current_lr)
+            
+            idx_start = (i - 1) * cfg.batch_size + 1
+            idx_end = i * cfg.batch_size
+            batch_ids = indices[idx_start:idx_end]
+
+            tokens_cpu = @view raw_data[:, batch_ids]
+            valid_tokens = Int(sum(tokens_cpu .!= pad_id))
+            if valid_tokens < max(2, cfg.batch_size * 2)
+                continue
+            end
+
+            x_cpu = Matrix{Int}(tokens_cpu)
+            x_batch = x_cpu |> dev
+            # Autoencoder target is same as input
+            y_batch = x_batch
+            
+            # Gradient
+            (loss, st_new, _), back = Zygote.pullback(
+                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id), ps
+            )
+
+            loss_val = Float32(loss)
+            spike = !(isfinite(loss_val)) || (loss_val > Float32(cfg.loss_spike_threshold))
+            if spike
+                stats = batch_stats(x_batch, vocab_size, pad_id, eos_id)
+                pad_frac = stats.n_pad / max(stats.n_total, 1)
+                eos_frac = stats.n_eos / max(stats.n_total, 1)
+                @printf "SPIKE Epoch %d Step %d Loss %.4f | x[min=%d max=%d] pad=%.3f eos=%.3f\n" epoch i loss_val stats.x_min stats.x_max pad_frac eos_frac
+                if stats.x_min < 1 || stats.x_max > vocab_size
+                    @printf "SPIKE TokenId out of range: expected [1,%d]\n" vocab_size
+                end
+                if cfg.skip_on_spike
+                    continue
+                end
+            end
+
+            grads = back((one(loss), nothing, nothing))[1]
+            grads, grad_norm, grad_scale = clip_grads(grads, Float32(cfg.grad_clip_norm))
+            if grad_scale < 1f0 && (i % 50 == 0 || grad_scale < 0.2f0)
+                @printf "GradClip Epoch %d Step %d | norm=%.4f scale=%.6f\n" epoch i grad_norm grad_scale
+            end
+
+            opt_state, ps = Optimisers.update(opt_state, ps, grads)
+            st = st_new
+            total_loss += loss_val
+            n_updates += 1
+            train_step += 1
+            
+            if i % 50 == 0
+                @printf "Epoch %d [%d/%d] Loss: %.4f | LR: %.2e (Target: %.2e)\n" epoch i num_batches loss_val current_lr target_lr
+            end
+
+            if cfg.save_every > 0 && (i % cfg.save_every == 0)
+                jldsave(
+                    joinpath(cfg.checkpoint_dir, "$(cfg.checkpoint_prefix)_epoch$(epoch)_step$(i).jld2");
+                    ps=ps |> cpu,
+                    st=st |> cpu,
+                    opt_state=opt_state |> cpu,
+                    epoch=epoch,
+                    step=i,
+                    train_step=train_step,
+                )
+            end
+        end
+        
+        avg_loss = total_loss / max(n_updates, 1)
+        println("Epoch $epoch Completed. Avg Loss: $avg_loss")
+        flush(stdout)
+        
+        # Save Checkpoint
+        jldsave(
+            joinpath(cfg.checkpoint_dir, "$(cfg.checkpoint_prefix)_epoch$epoch.jld2");
+            ps=ps |> cpu,
+            st=st |> cpu,
+            opt_state=opt_state |> cpu,
+            epoch=epoch,
+            step=0,
+            train_step=train_step,
+        )
+    end
+end
+
+function inspect_data(cfg)
+    raw_data, vocab_size, block_size, pad_id, eos_id, vocab = load_data(cfg.data_file, cfg.meta_file)
+    N_total = size(raw_data, 2)
+    n = min(cfg.inspect_n, N_total)
+
+    rng = Random.default_rng()
+    Random.seed!(rng, cfg.inspect_seed)
+    cols = shuffle(rng, 1:N_total)[1:n]
+
+    println("Inspect data_file=\$(cfg.data_file)")
+    println("Total samples: \$N_total, Vocab: \$vocab_size, Block: \$block_size, Showing: \$n")
+
+    x = Matrix{Int}(raw_data[:, cols])
+    print_training_samples(x, vocab, pad_id, eos_id; n=n)
+    return
+end
+
+function train_stage1(args::Vector{String})
+    if "--help" in args || "-h" in args
+        println("Usage: train_stage1 [options]")
+        println("Options:")
+        println("  --data-file <path>        Path to processed data file (default: \$DATA_FILE)")
+        println("  --meta-file <path>        Path to metadata file (default: derived from data-file)")
+        println("  --checkpoint-dir <path>   Directory to save checkpoints")
+        println("  --epochs <int>            Number of epochs")
+        println("  --batch-size <int>        Batch size")
+        println("  --lr <float>              Learning rate")
+        println("  --dim <int>               Model dimension")
+        println("  --warmup-steps <int>      Warmup steps (default: $WARMUP_STEPS)")
+        println("  --inspect-data            Inspect data instead of training")
+        return
+    end
+    cli = Utils.parse_cli_args(args)
+    cfg = resolve_config(cli)
+    if cfg.inspect_data
+        inspect_data(cfg)
+    else
+        train(cfg)
+    end
+end
+
+end # module Train

@@ -1,0 +1,41 @@
+HMTR.main([
+    "infer_stage1",
+    "--checkpoint-file", "ckpt_stage1_20260106_172138_epoch1_step30000.jld2",
+    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--text", "你好，世界"
+])
+
+HMTR.main([
+    "train_stage1",
+    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--dim", "512",
+    "--batch-size", "64",
+    "--epochs", "5",
+    "--lr", "1e-4",
+    "--warmup-steps", "1000",
+    "--save-every", "10000",
+    "--checkpoint-dir", "checkpoints",
+    "--grad-clip-norm", "5.0",
+    "--loss-spike-threshold", "10.0",
+    "--skip-on-spike", "1"
+])
+
+HMTR.main([
+    "train_stage1",
+    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--dim", "512",
+    "--batch-size", "64",
+    "--epochs", "5",
+    "--lr", "1e-4",
+    "--warmup-steps", "100",
+    "--save-every", "5000",
+    "--checkpoint-dir", "checkpoints",
+    "--grad-clip-norm", "5.0",
+    "--loss-spike-threshold", "10.0",
+    "--skip-on-spike", "1"
+])
+
+find . -mindepth 1 \
+       ! \( -name 'ckpt_stage1_20260106_172138_epoch1_step30000.jld2' \
+         -o -name 'ckpt_stage1_20260106_172138_epoch2_step25000.jld2' \) \
+       -exec rm -rf {} +

@@ -1,0 +1,14 @@
+.CondaPkg/
+checkpoints/
+data/
+.ipynb_checkpoints/
+*.jld2
+*.parquet
+*.pth
+*.ckpt
+*.tmp
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
