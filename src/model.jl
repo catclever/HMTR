@@ -82,9 +82,8 @@ Lux.initialstates(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
 function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
     d_model, L, batch = size(x)
     d_state = size(A, 2)
-
     h = similar(x, d_model, d_state, batch)
-    fill!(h, zero(eltype(h)))
+    Zygote.@ignore fill!(h, zero(eltype(h)))
 
     D2 = reshape(D, d_model, 1)
     A2 = reshape(A, d_model, d_state, 1)
@@ -92,8 +91,7 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
     if L == 0
         return similar(x, d_model, 0, batch)
     end
-
-    y_acc = similar(x, d_model, L, batch)
+    ys = Zygote.Buffer(x, d_model, L, batch)
 
     dt_min = 1f-4
     dt_scale = 0.1f0
@@ -112,10 +110,10 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
         h = h .* decay .+ (B3 .* dt3) .* xt3
 
         y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
-        view(y_acc, :, t, :) .= y
+        ys[:, t:t, :] = reshape(y, d_model, 1, batch)
     end
 
-    return y_acc
+    return copy(ys)
 end
 
 function (l::SimplifiedMambaBlock)(x, ps, st)
