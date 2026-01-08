@@ -8,16 +8,18 @@ HMTR.main([
 HMTR.main([
     "train_stage1",
     "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
-    "--dim", "512",
-    "--batch-size", "64",
+    "--dim", "256",
+    "--mamba-d-state", "64",
+    "--batch-size", "128",
     "--epochs", "5",
-    "--lr", "1e-4",
+    "--lr", "1e-3",
     "--warmup-steps", "1000",
     "--save-every", "10000",
     "--checkpoint-dir", "checkpoints",
     "--grad-clip-norm", "5.0",
     "--loss-spike-threshold", "10.0",
-    "--skip-on-spike", "1"
+    "--skip-on-spike", "1",
+    "--dtype", "bf16"
 ])
 
 HMTR.main([

@@ -275,6 +275,38 @@ function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu; show_id
     return
 end
 
+function infer_mamba_d_state_from_ps(ps, dim::Int)
+    function find_d_state(x)
+        if x isa NamedTuple
+            if haskey(x, :adt_proj)
+                ap = x.adt_proj
+                if ap isa NamedTuple && haskey(ap, :weight) && ap.weight isa AbstractArray
+                    out_dim = size(ap.weight, 1)
+                    diff = out_dim - dim
+                    if diff > 0 && diff % 2 == 0
+                        return diff ÷ 2
+                    end
+                end
+            end
+            for v in values(x)
+                ds = find_d_state(v)
+                ds === nothing || return ds
+            end
+            return nothing
+        elseif x isa Tuple
+            for v in x
+                ds = find_d_state(v)
+                ds === nothing || return ds
+            end
+            return nothing
+        else
+            return nothing
+        end
+    end
+
+    return find_d_state(ps)
+end
+
 function infer(cfg)
     meta = load_meta(cfg.data_file, cfg.meta_file)
 
@@ -288,7 +320,14 @@ function infer(cfg)
         error("Vocab size mismatch: ckpt vocab_size=$(vocab_size) but data meta vocab_size=$(meta.vocab_size)")
     end
 
-    model = HMTR_Stage1_AutoEncoder(vocab_size, dim, meta.block_size; pad_id=meta.pad_id, eos_id=meta.eos_id)
+    mamba_d_state = if haskey(ckpt, "mamba_d_state")
+        Int(ckpt["mamba_d_state"])
+    else
+        ds = infer_mamba_d_state_from_ps(ps, dim)
+        ds === nothing ? 16 : Int(ds)
+    end
+
+    model = HMTR_Stage1_AutoEncoder(vocab_size, dim, meta.block_size; pad_id=meta.pad_id, eos_id=meta.eos_id, mamba_d_state=mamba_d_state)
 
     dev = select_device(cfg.force_cpu)
     cpu = cpu_device()

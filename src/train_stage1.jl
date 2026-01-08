@@ -37,6 +37,7 @@ const INSPECT_DATA = parse(Int, get(ENV, "INSPECT_DATA", "0"))
 const INSPECT_N = parse(Int, get(ENV, "INSPECT_N", "3"))
 const INSPECT_SEED = parse(Int, get(ENV, "INSPECT_SEED", "42"))
 const MODEL_DIM = parse(Int, get(ENV, "MODEL_DIM", "256"))
+const MAMBA_D_STATE = parse(Int, get(ENV, "MAMBA_D_STATE", "16"))
 const DTYPE = get(ENV, "DTYPE", "fp32")
 const ENCODER_DTYPE = get(ENV, "ENCODER_DTYPE", "")
 const NORM_DTYPE = get(ENV, "NORM_DTYPE", "")
@@ -88,6 +89,7 @@ function resolve_config(cli::Dict{Symbol, Any})
     epochs = parse(Int, string(get(cli, :epochs, EPOCHS)))
     batch_size = parse(Int, string(get(cli, :batch_size, BATCH_SIZE)))
     dim = parse(Int, string(get(cli, :dim, MODEL_DIM)))
+    mamba_d_state = parse(Int, string(get(cli, :mamba_d_state, MAMBA_D_STATE)))
     lr = parse(Float64, string(get(cli, :lr, LR)))
     max_batches = parse(Int, string(get(cli, :max_batches, MAX_BATCHES)))
     save_every = parse(Int, string(get(cli, :save_every, SAVE_EVERY)))
@@ -137,6 +139,9 @@ function resolve_config(cli::Dict{Symbol, Any})
     if dim != MODEL_DIM && !occursin("_d$(dim)", checkpoint_prefix)
         checkpoint_prefix = "$(checkpoint_prefix)_d$(dim)"
     end
+    if mamba_d_state != MAMBA_D_STATE && !occursin("_ds$(mamba_d_state)", checkpoint_prefix)
+        checkpoint_prefix = "$(checkpoint_prefix)_ds$(mamba_d_state)"
+    end
 
     if !prefix_explicit || add_timestamp
         ts = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
@@ -151,6 +156,7 @@ function resolve_config(cli::Dict{Symbol, Any})
         epochs,
         batch_size,
         dim,
+        mamba_d_state,
         lr,
         max_batches,
         save_every,
@@ -463,7 +469,7 @@ function train(cfg)
     rng = Random.default_rng()
     Random.seed!(rng, 42)
     
-    model = HMTR_Stage1_AutoEncoder(vocab_size, cfg.dim, block_size; pad_id=pad_id, eos_id=eos_id)
+    model = HMTR_Stage1_AutoEncoder(vocab_size, cfg.dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state)
     ps0, st0 = Lux.setup(rng, model)
     ps = ps0
     st = st0
@@ -630,6 +636,7 @@ function train(cfg)
                     epoch=epoch,
                     step=i,
                     train_step=train_step,
+                    mamba_d_state=cfg.mamba_d_state,
                 )
             end
         end
@@ -647,6 +654,7 @@ function train(cfg)
             epoch=epoch,
             step=0,
             train_step=train_step,
+            mamba_d_state=cfg.mamba_d_state,
         )
     end
 end
@@ -679,6 +687,7 @@ function train_stage1(args::Vector{String})
         println("  --batch-size <int>        Batch size")
         println("  --lr <float>              Learning rate")
         println("  --dim <int>               Model dimension")
+        println("  --mamba-d-state <int>     Mamba d_state (default: $MAMBA_D_STATE)")
         println("  --warmup-steps <int>      Warmup steps (default: $WARMUP_STEPS)")
         println("  --inspect-data            Inspect data instead of training")
         return

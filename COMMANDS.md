@@ -80,8 +80,39 @@ HMTR.main([
 ])
 ```
 
+#### 🧮 BF16 / 混合精度训练 (BF16 / Mixed Precision)
+通过以下参数控制精度（支持：`fp32` / `fp16` / `bf16`）：
+- `--dtype`: 全局默认精度
+- `--encoder-dtype` / `--norm-dtype` / `--decoder-dtype`: 分模块覆盖全局精度
+
+```julia
+# 1) 全局 BF16（最简单）
+HMTR.main([
+    "train_stage1",
+    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--dim", "256",
+    "--batch-size", "128",
+    "--epochs", "10",
+    "--lr", "1e-3",
+    "--dtype", "bf16"
+])
+
+# 2) 混合精度：Encoder/Decoder 用 BF16，Norm 用 FP32（更稳）
+HMTR.main([
+    "train_stage1",
+    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--dim", "256",
+    "--batch-size", "128",
+    "--epochs", "10",
+    "--lr", "1e-3",
+    "--dtype", "bf16",
+    "--norm-dtype", "fp32"
+])
+```
+
 **关键参数说明:**
 - `--dim`: 模型维度 (默认 256)
+- `--mamba-d-state`: Mamba 内部 SSM state 维度 (默认 16)，会影响 Encoder 计算/显存
 - `--lr`: 学习率 (默认 1e-3)
 - `--warmup-steps`: 预热步数 (默认 500)，在此期间 LR 线性增加
 - `--grad-clip-norm`: 梯度裁剪阈值 (默认 5.0)
@@ -140,6 +171,7 @@ HMTR.main([
 nohup julia --project=. hmtr.jl train_stage1 \
   --data-file data/processed_char_bs32_20260106_163247.jld2 \
   --dim 256 \
+  --mamba-d-state 16 \
   --epochs 10 \
   > train.log 2>&1 &
 ```

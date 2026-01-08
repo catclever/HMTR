@@ -9,6 +9,8 @@ using LuxCUDA
 
 export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, NanoDecoder, HMTR_Stage1_AutoEncoder
 
+hippo_A_diag(d_state::Int, ::Type{T}=Float32) where {T<:AbstractFloat} = -(T.(collect(1:d_state)))
+
 struct FeatureLayerNorm <: Lux.AbstractLuxLayer
     dim::Int
     epsilon::Float32
@@ -67,7 +69,7 @@ Lux.initialparameters(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
     in_proj = Lux.initialparameters(rng, l.in_proj),
     out_proj = Lux.initialparameters(rng, l.out_proj),
     adt_proj = Lux.initialparameters(rng, l.adt_proj),
-    A = -exp.(randn(rng, Float32, l.d_model, l.d_state)),
+    A = repeat(reshape(hippo_A_diag(l.d_state, Float32), 1, l.d_state), l.d_model, 1),
     D = ones(Float32, l.d_model)
 )
 
@@ -147,11 +149,11 @@ struct MambaCompressor{L <: Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
     eos_id::Int
 end
 
-function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::Int=1, eos_id::Int=2)
+function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
     # 2 layers of "Simplified Mamba"
     layers = Chain(
-        SimplifiedMambaBlock(dim),
-        SimplifiedMambaBlock(dim)
+        SimplifiedMambaBlock(dim, mamba_d_state),
+        SimplifiedMambaBlock(dim, mamba_d_state)
     )
     return MambaCompressor(Embedding(vocab_size => dim), layers, block_size, dim, pad_id, eos_id)
 end
@@ -422,8 +424,8 @@ struct HMTR_Stage1_AutoEncoder{E, N, D} <: Lux.AbstractLuxLayer
     decoder::D
 end
 
-function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512, block_size::Int=8; pad_id::Int=1, eos_id::Int=2)
-    enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id)
+function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512, block_size::Int=8; pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
+    enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
     norm = FeatureLayerNorm(dim)
     dec = NanoDecoder(dim, vocab_size, block_size)
     return HMTR_Stage1_AutoEncoder(enc, norm, dec)
