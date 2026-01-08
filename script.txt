@@ -23,7 +23,7 @@ HMTR.main([
 HMTR.main([
     "train_stage1",
     "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
-    "--resume-ckpt", "checkpoints/ckpt_stage1_d512_20260108_111653_epoch1_step10000.jld2"
+    "--resume-ckpt", "checkpoints/ckpt_stage1_d512_20260108_111653_epoch1_step10000.jld2",
     "--dim", "512",
     "--batch-size", "64",
     "--epochs", "5",
