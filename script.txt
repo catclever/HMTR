@@ -1,3 +1,34 @@
+using CUDA
+
+# 1. 切断所有大对象的引用 (把变量设为空)
+# 我把所有可能用到的变量名都写上了，多写没事
+ps = nothing
+st = nothing
+opt_state = nothing
+grads = nothing
+model = nothing
+x = nothing
+y = nothing
+batch = nothing
+dataloader = nothing
+
+# 2. 暴力执行垃圾回收 (建议跑两次，确保彻底)
+GC.gc(true)
+GC.gc(true)
+
+# 3. 命令 CUDA 释放未使用的显存池
+CUDA.reclaim()
+
+# 4. (可选) 检查显存是否回来了
+println("当前可用显存: $(round(CUDA.available_memory() / 1024^3, digits=2)) GB")
+
+HMTR.main(["data", 
+    "--block-size", "12", 
+    "--parquest-file","./data/wiki_filtered.parquest",
+    "--data-dir","./data"
+])
+
+
 HMTR.main([
     "infer_stage1",
     "--checkpoint-file", "ckpt_stage1_20260106_172138_epoch1_step30000.jld2",
@@ -7,19 +38,18 @@ HMTR.main([
 
 HMTR.main([
     "train_stage1",
-    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--data-file", "processed_char_bs12_20260108_221348.jld2",
     "--dim", "256",
-    "--mamba-d-state", "64",
-    "--batch-size", "128",
+    "--mamba-d-state", "16",
+    "--batch-size", "256",
     "--epochs", "5",
     "--lr", "1e-3",
-    "--warmup-steps", "1000",
+    "--warmup-steps", "2000",
     "--save-every", "10000",
     "--checkpoint-dir", "checkpoints",
     "--grad-clip-norm", "5.0",
     "--loss-spike-threshold", "10.0",
-    "--skip-on-spike", "1",
-    "--dtype", "bf16"
+    "--skip-on-spike", "1"
 ])
 
 HMTR.main([

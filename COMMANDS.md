@@ -42,7 +42,7 @@ include("hmtr.jl")
 HMTR.main(["data"])
 
 # 指定 Block Size (例如 64)
-HMTR.main(["data", "--block-size", "64"])
+HMTR.main(["data", "--block-size", "64", "--parquest-file","./data/*.parquest"])
 ```
 
 ### 🏋️ 训练 Stage 1 (AutoEncoder)

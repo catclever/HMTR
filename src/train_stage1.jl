@@ -448,7 +448,7 @@ and Revise.jl will hot-reload it, allowing dynamic LR adjustment.
 @noinline function get_target_lr(base_lr::Float64)
     # Default behavior: use the configured LR.
     # To adjust dynamically: replace `return base_lr` with `return 2e-4` (or any value) and save the file.
-    val = base_lr*2
+    val = base_lr
     # println("DEBUG: get_target_lr($base_lr) -> $val") # Commented out to avoid spam, uncomment to debug
     return val
 end

@@ -153,6 +153,8 @@ function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::I
     # 2 layers of "Simplified Mamba"
     layers = Chain(
         SimplifiedMambaBlock(dim, mamba_d_state),
+        SimplifiedMambaBlock(dim, mamba_d_state),
+        SimplifiedMambaBlock(dim, mamba_d_state),
         SimplifiedMambaBlock(dim, mamba_d_state)
     )
     return MambaCompressor(Embedding(vocab_size => dim), layers, block_size, dim, pad_id, eos_id)
