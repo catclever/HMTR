@@ -1,5 +1,6 @@
 .CondaPkg/
 checkpoints/
+**/checkpoints/
 data/
 .ipynb_checkpoints/
 *.jld2
