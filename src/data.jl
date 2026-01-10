@@ -10,7 +10,7 @@ using ..Utils
 
 export data_prep
 
-const PROJECT_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 const DEFAULT_DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
 const DEFAULT_PARQUET_FILE = get(ENV, "PARQUET_FILE", "")
 const DEFAULT_TOKENIZER_NAME = get(ENV, "TOKENIZER_NAME", "")
@@ -18,7 +18,7 @@ const DEFAULT_MAX_DOCS = parse(Int, get(ENV, "MAX_DOCS", "0"))
 const DEFAULT_CHAR_VOCAB_DOCS = parse(Int, get(ENV, "CHAR_VOCAB_DOCS", "10000"))
 const DEFAULT_META_FILE = get(ENV, "META_FILE", "")
 
-function resolve_config(cli::Dict{Symbol, Any})
+function resolve_config(cli::Dict{Symbol,Any})
     data_dir = string(get(cli, :data_dir, DEFAULT_DATA_DIR))
     parquet_file = string(get(cli, :parquet_file, DEFAULT_PARQUET_FILE))
     tokenizer_name = string(get(cli, :tokenizer_name, DEFAULT_TOKENIZER_NAME))
@@ -46,7 +46,7 @@ function resolve_config(cli::Dict{Symbol, Any})
     return (; data_dir, parquet_file, tokenizer_name, max_docs, char_vocab_docs, block_size, output_file, meta_file)
 end
 
-function resolve_output_file(mode::AbstractString, data_dir::AbstractString, block_size::Int, tokenizer_name::AbstractString; output_file::AbstractString = "")
+function resolve_output_file(mode::AbstractString, data_dir::AbstractString, block_size::Int, tokenizer_name::AbstractString; output_file::AbstractString="")
     if !isempty(output_file)
         return output_file
     end
@@ -55,15 +55,15 @@ function resolve_output_file(mode::AbstractString, data_dir::AbstractString, blo
         error("--tokenizer-name is required for tokenizer mode")
     end
     label = mode == "char" ? "char" : "tok_" * sanitize_component(tokenizer_name)
-    return joinpath(data_dir, "processed_$(label)_bs$(block_size)_$(ts).jld2")
+    return joinpath(data_dir, "processed_$(label)_buckets_$(ts).jld2")
 end
 
-function resolve_meta_file(output_file::AbstractString; meta_file::AbstractString = "")
+function resolve_meta_file(output_file::AbstractString; meta_file::AbstractString="")
     if !isempty(meta_file)
         return meta_file
     end
     if endswith(output_file, ".jld2")
-        base = output_file[1:end - 5]
+        base = output_file[1:end-5]
         return base * "_meta.jld2"
     end
     return output_file * "_meta.jld2"
@@ -82,10 +82,10 @@ function load_parquet_data(path::String)
     println("Loading Parquet file: $path")
     ds = Parquet2.Dataset(path)
     df = DataFrame(ds)
-    
+
     col_names = names(df)
     println("Columns: $col_names")
-    
+
     if "text" in col_names
         return df.text
     elseif "content" in col_names
@@ -138,11 +138,11 @@ function init_tokenizer(tokenizer_name::AbstractString)
     end
 
     vocab_py = tokenizer.get_vocab()
-    vocab_jl = pyconvert(Dict{String, Int}, vocab_py)
+    vocab_jl = pyconvert(Dict{String,Int}, vocab_py)
     max_id = maximum(values(vocab_jl))
     id_to_token = fill("", max(vocab_size, max_id + 1))
     for (tok, tid) in vocab_jl
-        id_to_token[tid + 1] = tok
+        id_to_token[tid+1] = tok
     end
 
     return tokenizer, vocab_size, pad_id, eos_id, unk_id, punct_ids, id_to_token
@@ -200,57 +200,117 @@ function encode_chars(s::String, char_map, unk_id::Int)
     return out
 end
 
-function process_data_char(texts, output_file::AbstractString, meta_file::AbstractString, block_size::Int, char_vocab_docs::Int)
+
+function process_data_char(texts, output_file::AbstractString, meta_file::AbstractString, input_block_size::Int, char_vocab_docs::Int)
+    # input_block_size is ignored or used as max? User said buckets 8, 16, 32, 64, 128.
+    BUCKETS = [8, 16, 32, 64, 128]
+    MAX_LEN = 128
+
     sample_texts = texts[1:min(end, char_vocab_docs)]
     vocab_chars = sort!(collect(build_char_set(sample_texts)))
 
-    char_map = Dict{Char, Int}(c => i + 3 for (i, c) in enumerate(vocab_chars))
+    char_map = Dict{Char,Int}(c => i + 3 for (i, c) in enumerate(vocab_chars))
     PAD_ID = 1
     EOS_ID = 2
     UNK_ID = 3
     vocab_size = length(char_map) + 3
 
-    total_blocks = count_total_blocks_char(texts, block_size)
     println("Vocabulary size: $vocab_size")
-    println("Total blocks to generate: $total_blocks")
 
-    data_matrix = Matrix{Int}(undef, block_size, total_blocks)
-    col = 1
+    # Store data as Vector of Vectors first, then convert to Matrix
+    bucket_data = Dict{Int,Vector{Vector{Int}}}()
+    for b in BUCKETS
+        bucket_data[b] = Vector{Int}[]
+    end
+
+    total_docs = length(texts)
     for (idx, doc) in enumerate(texts)
         if idx % 1000 == 0
-            println("Processing doc $idx / $(length(texts))")
+            println("Processing doc $idx / $total_docs")
         end
 
         s = normalize_text(doc)
         isempty(s) && continue
-        for seg in split_sentences_zh(s)
+
+        segments = split_sentences_zh(s)
+        n_segs = length(segments)
+
+        for (seg_i, seg) in enumerate(segments)
             ids = encode_chars(seg, char_map, UNK_ID)
-            if length(ids) >= block_size
-                ids = ids[1:block_size]
-                @inbounds for j in 1:block_size
-                    data_matrix[j, col] = ids[j]
-                end
-            else
-                @inbounds begin
-                    for j in 1:length(ids)
-                        data_matrix[j, col] = ids[j]
-                    end
-                    data_matrix[length(ids) + 1, col] = EOS_ID
-                    for j in (length(ids) + 2):block_size
-                        data_matrix[j, col] = PAD_ID
-                    end
+
+            # EOS logic: Only at the very end of the document
+            if seg_i == n_segs
+                push!(ids, EOS_ID)
+            end
+
+            L = length(ids)
+            if L == 0
+                continue
+            end
+
+            # Find bucket
+            target_bucket = 0
+            for b in BUCKETS
+                if L <= b
+                    target_bucket = b
+                    break
                 end
             end
-            col += 1
+
+            # If length exceeds max bucket, truncate or skip?
+            # User requirement: "Each training data is a complete sentence"
+            # If sentence is too long, we might have to truncate to MAX_LEN.
+            if target_bucket == 0
+                target_bucket = MAX_LEN
+                ids = ids[1:MAX_LEN]
+                # If we truncated the last sentence, we lost EOS? 
+                # If it was the last sentence, make sure EOS is preserved?
+                # For simplicity, just strict truncate.
+                # Or maybe force the last token to be EOS if it was supposed to have one?
+                if seg_i == n_segs && ids[end] != EOS_ID
+                    ids[end] = EOS_ID
+                end
+            end
+
+            # Pad
+            curr_len = length(ids)
+            if curr_len < target_bucket
+                padding = fill(PAD_ID, target_bucket - curr_len)
+                append!(ids, padding)
+            end
+
+            push!(bucket_data[target_bucket], ids)
         end
     end
 
+    # Convert to Matrices
+    final_data = Dict{String,Any}()
+    total_samples = 0
+
+    for b in BUCKETS
+        vecs = bucket_data[b]
+        n_samples = length(vecs)
+        if n_samples > 0
+            mat = Matrix{Int}(undef, b, n_samples)
+            for i in 1:n_samples
+                mat[:, i] = vecs[i]
+            end
+            final_data[string(b)] = mat
+            total_samples += n_samples
+            println("Bucket $b: $n_samples samples")
+        end
+    end
+
+    if total_samples == 0
+        println("Warning: No data generated!")
+    end
+
     id_to_token = fill("", vocab_size + 1)
-    id_to_token[PAD_ID + 1] = "<PAD>"
-    id_to_token[EOS_ID + 1] = "<EOS>"
-    id_to_token[UNK_ID + 1] = "<UNK>"
+    id_to_token[PAD_ID+1] = "<PAD>"
+    id_to_token[EOS_ID+1] = "<EOS>"
+    id_to_token[UNK_ID+1] = "<UNK>"
     for (c, tid) in char_map
-        id_to_token[tid + 1] = string(c)
+        id_to_token[tid+1] = string(c)
     end
 
     println("Saving to $output_file...")
@@ -258,13 +318,14 @@ function process_data_char(texts, output_file::AbstractString, meta_file::Abstra
         "PAD" => PAD_ID,
         "EOS" => EOS_ID,
         "UNK" => UNK_ID,
-        "BLOCK_SIZE" => block_size,
+        "BUCKETS" => BUCKETS,
         "VOCAB_SIZE" => vocab_size,
         "TOKENIZE_MODE" => "char",
     )
+
     jldsave(
         output_file;
-        data=data_matrix,
+        data=final_data, # Now a Dict
         char_map=char_map,
         vocab=id_to_token,
         params=params,
@@ -273,44 +334,105 @@ function process_data_char(texts, output_file::AbstractString, meta_file::Abstra
     println("Done.")
 end
 
-function process_data_tokenizer(texts, output_file::AbstractString, meta_file::AbstractString, block_size::Int, tokenizer_name::AbstractString)
+function process_data_tokenizer(texts, output_file::AbstractString, meta_file::AbstractString, input_block_size::Int, tokenizer_name::AbstractString)
+    # Similar adaptation for tokenizer mode if needed. 
+    # For now, implementing same bucket logic.
     tokenizer, vocab_size, PAD_ID, EOS_ID, UNK_ID, punct_ids, id_to_token = init_tokenizer(tokenizer_name)
     println("Vocabulary size: $vocab_size")
 
-    data_matrix = Matrix{Int}(undef, block_size, 1024)
-    col = 1
+    BUCKETS = [8, 16, 32, 64, 128]
+    MAX_LEN = 128
+
+    bucket_data = Dict{Int,Vector{Vector{Int}}}()
+    for b in BUCKETS
+        bucket_data[b] = Vector{Int}[]
+    end
+
+    total_docs = length(texts)
     for (idx, doc) in enumerate(texts)
         if idx % 1000 == 0
-            println("Processing doc $idx / $(length(texts))")
+            println("Processing doc $idx / $total_docs")
         end
 
         s = normalize_text(doc)
         isempty(s) && continue
 
-        ids = encode_ids(tokenizer, s)
-        data_matrix, col = append_blocks_tokenizer!(data_matrix, col, ids, PAD_ID, EOS_ID, punct_ids, block_size)
+        # Tokenizer usually tokenizes whole text. 
+        # But we need sentence splitting. 
+        # We can use the simple punctuation splitter on strings first, then tokenize.
+        segments = split_sentences_zh(s)
+        n_segs = length(segments)
+
+        for (seg_i, seg) in enumerate(segments)
+            ids = encode_ids(tokenizer, seg)
+
+            if seg_i == n_segs
+                push!(ids, EOS_ID)
+            end
+
+            L = length(ids)
+            if L == 0
+                continue
+            end
+
+            target_bucket = 0
+            for b in BUCKETS
+                if L <= b
+                    target_bucket = b
+                    break
+                end
+            end
+
+            if target_bucket == 0
+                target_bucket = MAX_LEN
+                ids = ids[1:MAX_LEN]
+                if seg_i == n_segs && ids[end] != EOS_ID
+                    ids[end] = EOS_ID
+                end
+            end
+
+            curr_len = length(ids)
+            if curr_len < target_bucket
+                padding = fill(PAD_ID, target_bucket - curr_len)
+                append!(ids, padding)
+            end
+
+            push!(bucket_data[target_bucket], ids)
+        end
     end
 
-    data_matrix = data_matrix[:, 1:col-1]
+    final_data = Dict{String,Any}()
+
+    for b in BUCKETS
+        vecs = bucket_data[b]
+        n_samples = length(vecs)
+        if n_samples > 0
+            mat = Matrix{Int}(undef, b, n_samples)
+            for i in 1:n_samples
+                mat[:, i] = vecs[i]
+            end
+            final_data[string(b)] = mat
+        end
+    end
 
     println("Saving to $output_file...")
     params = Dict(
         "PAD" => PAD_ID,
         "EOS" => EOS_ID,
         "UNK" => UNK_ID,
-        "BLOCK_SIZE" => block_size,
+        "BUCKETS" => BUCKETS,
         "VOCAB_SIZE" => vocab_size,
         "TOKENIZER_NAME" => tokenizer_name,
         "TOKENIZE_MODE" => "tokenizer",
     )
     jldsave(
         output_file;
-        data=data_matrix,
-        char_map=Dict{Any, Any}(),
+        data=final_data,
+        char_map=Dict{Any,Any}(),
         vocab=id_to_token,
         params=params,
     )
-    save_metadata(meta_file; params=params, char_map=Dict{Any, Any}(), vocab=id_to_token)
+    save_metadata(meta_file; params=params, char_map=Dict{Any,Any}(), vocab=id_to_token)
     println("Done.")
 end
 
@@ -324,40 +446,8 @@ function ensure_capacity!(data_matrix::Matrix{Int}, needed_cols::Int)
     return out
 end
 
-function append_blocks_tokenizer!(data_matrix::Matrix{Int}, col::Int, ids::Vector{Int}, pad_id::Int, eos_id::Int, punct_ids::Set{Int}, block_size::Int)
-    pos = 1
-    while pos <= length(ids)
-        window_end = min(pos + block_size - 1, length(ids))
-        window = @view ids[pos:window_end]
-
-        cut = 0
-        for j in length(window):-1:1
-            if window[j] in punct_ids
-                cut = j
-                break
-            end
-        end
-        cut = cut == 0 ? length(window) : cut
-
-        data_matrix = ensure_capacity!(data_matrix, col)
-        @inbounds if cut >= block_size
-            for j in 1:block_size
-                data_matrix[j, col] = window[j]
-            end
-        else
-            for j in 1:cut
-                data_matrix[j, col] = window[j]
-            end
-            data_matrix[cut + 1, col] = eos_id
-            for j in (cut + 2):block_size
-                data_matrix[j, col] = pad_id
-            end
-        end
-        col += 1
-        pos += cut
-    end
-    return data_matrix, col
-end
+# Removed append_blocks_tokenizer! as it is no longer used in the new logic
+# Or keep it if we revert? Better remove unused code to clean up.
 
 function process(cfg)
     if !isdir(cfg.data_dir)
@@ -383,7 +473,7 @@ function process(cfg)
     println("Loaded $(length(texts)) documents.")
 
     mode = isempty(strip(cfg.tokenizer_name)) ? "char" : "tokenizer"
-    println("Chunking data into blocks of size $(cfg.block_size)...")
+    println("Chunking data into buckets [8, 16, 32, 64, 128]...")
     output_file = resolve_output_file(mode, cfg.data_dir, cfg.block_size, cfg.tokenizer_name; output_file=cfg.output_file)
     meta_file = resolve_meta_file(output_file; meta_file=cfg.meta_file)
     if mode == "char"
@@ -402,7 +492,7 @@ function data_prep(args::Vector{String})
         println("  --parquet-file <path>     Specific parquet file to load")
         println("  --tokenizer-name <str>    HuggingFace tokenizer name (or empty for char-level)")
         println("  --output-file <path>      Output .jld2 file path")
-        println("  --block-size <int>        Sequence length")
+        println("  --block-size <int>        (Ignored, using fixed buckets)")
         println("  --max-docs <int>          Limit number of documents")
         return
     end

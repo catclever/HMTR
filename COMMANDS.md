@@ -35,27 +35,29 @@ include("hmtr.jl")
 
 ### 📦 数据准备 (Data Preparation)
 
-将 Parquet 数据转换为训练所需的 JLD2 格式。
+将 Parquet 数据转换为训练所需的 JLD2 格式（自动按句子长度分桶：8, 16, 32, 64, 128）。
 
 ```julia
 # 基础用法 (自动处理 data/ 下的 .parquet 文件)
 HMTR.main(["data"])
 
-# 指定 Block Size (例如 64)
-HMTR.main(["data", "--block-size", "64", "--parquest-file","./data/*.parquest"])
+# 指定 Parquet 文件和文档数量限制
+HMTR.main(["data", "--max-docs", "1000", "--parquet-file", "./data/wiki_filtered.parquet"])
 ```
 
-### 🏋️ 训练 Stage 1 (AutoEncoder)
+输出文件通常命名为：`data/processed_char_buckets_yyyymmdd_HHMMSS.jld2`
+
+### 🏋️ 训练 Stage 1 (AutoEncoder w/ Mamba Decoder)
 
 #### ⚡ 快速测试 (Debug Run)
 用于验证代码逻辑，跑少量 Batch。
 ```julia
 HMTR.main([
     "train_stage1",
-    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--data-file", "data/processed_char_buckets_20260109_140845.jld2",
     "--epochs", "1",
     "--max-batches", "10",
-    "--batch-size", "8",
+    "--batch-size", "4",
     "--dim", "64",
     "--warmup-steps", "5",
     "--save-every", "0"
@@ -66,9 +68,10 @@ HMTR.main([
 ```julia
 HMTR.main([
     "train_stage1",
-    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--data-file", "data/processed_char_buckets_20260109_140845.jld2",
     "--dim", "256",
-    "--batch-size", "128",
+    "--mamba-d-state", "16",
+    "--batch-size", "32", 
     "--epochs", "10",
     "--lr", "1e-3",
     "--warmup-steps", "500",
@@ -89,9 +92,9 @@ HMTR.main([
 # 1) 全局 BF16（最简单）
 HMTR.main([
     "train_stage1",
-    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--data-file", "data/processed_char_buckets_20260109_140845.jld2",
     "--dim", "256",
-    "--batch-size", "128",
+    "--batch-size", "64",
     "--epochs", "10",
     "--lr", "1e-3",
     "--dtype", "bf16"
@@ -100,9 +103,9 @@ HMTR.main([
 # 2) 混合精度：Encoder/Decoder 用 BF16，Norm 用 FP32（更稳）
 HMTR.main([
     "train_stage1",
-    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--data-file", "data/processed_char_buckets_20260109_140845.jld2",
     "--dim", "256",
-    "--batch-size", "128",
+    "--batch-size", "64",
     "--epochs", "10",
     "--lr", "1e-3",
     "--dtype", "bf16",
@@ -124,7 +127,7 @@ HMTR.main([
 ```julia
 HMTR.main([
     "train_stage1",
-    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--data-file", "data/processed_char_buckets_20260109_140845.jld2",
     "--dim", "256",
     "--resume-ckpt", "checkpoints/ckpt_stage1_epoch2_step5000.jld2"
 ])
@@ -138,7 +141,7 @@ HMTR.main([
 HMTR.main([
     "infer_stage1",
     "--checkpoint-file", "checkpoints/ckpt_stage1_latest.jld2",
-    "--data-file", "data/processed_char_bs32_20260106_163247.jld2",
+    "--data-file", "data/processed_char_buckets_20260109_140845.jld2",
     "--interactive"
 ])
 ```
