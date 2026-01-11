@@ -9,6 +9,7 @@ using Printf
 using NNlib
 using CUDA
 using LuxCUDA
+import ChainRulesCore
 using Dates
 using ..Utils
 using ..Model
@@ -306,6 +307,71 @@ function logsoftmax_stable(x; dims::Int)
     return y .- lse
 end
 
+function _gather2d_kernel(out, a, idx, N)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= N
+        @inbounds out[i] = a[idx[i], i]
+    end
+    return
+end
+
+function _scatter2d_kernel(da, idx, dout, N)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= N
+        @inbounds da[idx[i], i] = dout[i]
+    end
+    return
+end
+
+function gather2d(a::AbstractMatrix, idx::AbstractVector{<:Integer})
+    N = length(idx)
+    out = similar(a, eltype(a), N)
+    @inbounds for i in 1:N
+        out[i] = a[idx[i], i]
+    end
+    return out
+end
+
+function gather2d(a::CUDA.CuArray, idx::CUDA.CuArray)
+    N = length(idx)
+    out = similar(a, eltype(a), N)
+    threads = 256
+    blocks = cld(N, threads)
+    CUDA.@cuda threads=threads blocks=blocks _gather2d_kernel(out, a, idx, N)
+    return out
+end
+
+function ChainRulesCore.rrule(::typeof(gather2d), a::AbstractMatrix, idx::AbstractVector{<:Integer})
+    y = gather2d(a, idx)
+
+    function pullback(ȳ)
+        da = similar(a)
+        fill!(da, zero(eltype(da)))
+        @inbounds for i in 1:length(idx)
+            da[idx[i], i] += ȳ[i]
+        end
+        return (ChainRulesCore.NoTangent(), da, ChainRulesCore.ZeroTangent())
+    end
+
+    return y, pullback
+end
+
+function ChainRulesCore.rrule(::typeof(gather2d), a::CUDA.CuArray, idx::CUDA.CuArray)
+    y = gather2d(a, idx)
+
+    function pullback(ȳ)
+        da = similar(a)
+        fill!(da, zero(eltype(da)))
+        N = length(idx)
+        threads = 256
+        blocks = cld(N, threads)
+        CUDA.@cuda threads=threads blocks=blocks _scatter2d_kernel(da, idx, ȳ, N)
+        return (ChainRulesCore.NoTangent(), da, ChainRulesCore.ZeroTangent())
+    end
+
+    return y, pullback
+end
+
 function load_data(data_file::AbstractString, meta_file::AbstractString)
     if !isfile(data_file)
         error("Data file $(data_file) not found!")
@@ -384,23 +450,48 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::In
 
     # Decoder needs target length. For AutoEncoder, target len = input len.
     L, B = size(x_batch)
-    y_pred, st_dec = model.decoder(capsules_norm, ps.decoder, st.decoder; target_len=L)
+    y_pred, st_dec = model.decoder(capsules_norm, y_batch, ps.decoder, st.decoder; start_id=start_id)
 
     st_new = (encoder=st_enc, norm=st_norm, decoder=st_dec)
 
     vocab_size = size(y_pred, 1)
-    y_pred_flat = reshape(y_pred, vocab_size, :)
-    y_batch_flat = reshape(y_batch, :)
+    K = max(getfield(model.decoder, :block_size), 1)
+    Lpad = K * cld(L, K)
+    Lcap = Lpad ÷ K
+
+    y_pred_pad = if Lpad == L
+        y_pred
+    else
+        pad_part = similar(y_pred, vocab_size, Lpad - L, B)
+        Zygote.@ignore fill!(pad_part, zero(eltype(pad_part)))
+        cat(y_pred, pad_part; dims=2)
+    end
+
+    y_batch_pad = if Lpad == L
+        y_batch
+    else
+        pad_part = similar(y_batch, Lpad - L, B)
+        Zygote.@ignore fill!(pad_part, pad_id)
+        cat(y_batch, pad_part; dims=1)
+    end
+
+    y_pred_flat = reshape(y_pred_pad, vocab_size, :)
+    y_batch_flat = reshape(y_batch_pad, :)
 
     logits = eltype(y_pred_flat) <: Union{Float16,Core.BFloat16} ? Float32.(y_pred_flat) : y_pred_flat
     log_probs = logsoftmax_stable(logits; dims=1)
+
     mask = y_batch_flat .!= pad_id
-    denom = max(Float32(sum(mask)), 1f0)
     weights = Float32.(mask)
 
-    lin = y_batch_flat .+ (eachindex(y_batch_flat) .- 1) .* vocab_size
-    picked = log_probs[lin]
-    loss = -(sum(picked .* weights) / denom)
+    picked = gather2d(log_probs, y_batch_flat)
+    picked3 = reshape(picked, K, Lcap, B)
+    weights3 = reshape(weights, K, Lcap, B)
+
+    num = dropdims(sum((-picked3) .* weights3; dims=(1, 3)); dims=(1, 3))
+    den = dropdims(sum(weights3; dims=(1, 3)); dims=(1, 3))
+    per_chunk = num ./ max.(den, 1f0)
+    loss = sum(per_chunk) / max(Float32(length(per_chunk)), 1f0)
 
     return loss, st_new, (;)
 end

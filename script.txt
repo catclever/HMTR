@@ -23,7 +23,6 @@ CUDA.reclaim()
 println("当前可用显存: $(round(CUDA.available_memory() / 1024^3, digits=2)) GB")
 
 HMTR.main(["data", 
-    "--block-size", "12", 
     "--parquest-file","./data/wiki_filtered.parquest",
     "--data-dir","./data"
 ])
@@ -38,16 +37,16 @@ HMTR.main([
 
 HMTR.main([
     "train_stage1",
-    "--data-file", "processed_char_bs12_20260108_221348.jld2",
+    "--data-file", "processed_char_buckets_20260110_163303.jld2",
     "--dim", "256",
     "--mamba-d-state", "16",
-    "--batch-size", "256",
+    "--batch-size", "128",
     "--epochs", "5",
-    "--lr", "1e-3",
-    "--warmup-steps", "2000",
+    "--lr", "3e-4",
+    "--warmup-steps", "500",
     "--save-every", "10000",
     "--checkpoint-dir", "checkpoints",
-    "--grad-clip-norm", "5.0",
+    "--grad-clip-norm", "7.5",
     "--loss-spike-threshold", "10.0",
     "--skip-on-spike", "1"
 ])

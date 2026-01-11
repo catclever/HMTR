@@ -106,7 +106,7 @@ function load_meta(data_file::AbstractString, meta_file::AbstractString)
     end
     params === nothing && error("data file missing key \"params\"")
 
-    block_size = params["BLOCK_SIZE"]
+    block_size = get(params, "BLOCK_SIZE", 8)
     pad_id = params["PAD"]
     eos_id = params["EOS"]
     unk_id = get(params, "UNK", 0)
@@ -170,6 +170,20 @@ function encode_text_to_blocks(text::AbstractString, meta)
     return x
 end
 
+function encode_text_to_seq(text::AbstractString, meta)
+    s = normalize_text(text)
+    ids = Vector{Int}()
+    if !isempty(meta.char_map)
+        for c in s
+            push!(ids, get(meta.char_map, c, meta.unk_id))
+        end
+    else
+        error("char_map is empty; this inference mode expects char-tokenized data")
+    end
+    push!(ids, meta.eos_id)
+    return reshape(ids, :, 1)
+end
+
 function decode_ids(ids::AbstractVector{Int}, meta)
     out = IOBuffer()
     for tid in ids
@@ -215,7 +229,7 @@ end
 
 function greedy_decode_capsules(decoder, capsules, ps_dec, st_dec, meta, dev, cpu)
     D, L_cap, B = size(capsules)
-    K = meta.block_size
+    K = hasproperty(decoder, :block_size) ? getfield(decoder, :block_size) : meta.block_size
 
     latents_flat = copy(reshape(capsules, D, :))
     N_capsules = size(latents_flat, 2)
@@ -238,8 +252,12 @@ function greedy_decode_capsules(decoder, capsules, ps_dec, st_dec, meta, dev, cp
         out_buf[:, k, :] = logits
 
         if k < K
-            idxs = argmax(logits; dims=1) |> cpu
-            prev_ids = vec(map(ci -> Int(ci[1]), idxs))
+            logits_cpu = logits |> cpu
+            prev_ids = Vector{Int}(undef, size(logits_cpu, 2))
+            for i in 1:size(logits_cpu, 2)
+                _, idx = findmax(@view logits_cpu[:, i])
+                prev_ids[i] = Int(idx)
+            end
             x_in, st_emb = decoder.embedding(prev_ids |> dev, ps_dec.embedding, st_emb)
         end
     end
@@ -250,15 +268,15 @@ function greedy_decode_capsules(decoder, capsules, ps_dec, st_dec, meta, dev, cp
 end
 
 function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu; show_ids::Bool)
-    x = encode_text_to_blocks(text, meta)
+    x = encode_text_to_seq(text, meta)
     x_dev = x |> dev
 
     capsules, _st_enc = model.encoder(x_dev, ps.encoder, st.encoder)
     capsules_norm, _st_norm = model.norm(capsules, ps.norm, st.norm)
     pred = greedy_decode_capsules(model.decoder, capsules_norm, ps.decoder, st.decoder, meta, dev, cpu)
 
-    input_text = decode_blocks(x, meta)
-    pred_text = decode_blocks(pred, meta)
+    input_text = decode_ids(vec(x), meta)
+    pred_text = decode_ids(vec(pred), meta)
 
     println("Input:  ", text)
     println("Tokens: ", input_text)
@@ -327,7 +345,7 @@ function infer(cfg)
         ds === nothing ? 16 : Int(ds)
     end
 
-    model = HMTR_Stage1_AutoEncoder(vocab_size, dim, meta.block_size; pad_id=meta.pad_id, eos_id=meta.eos_id, mamba_d_state=mamba_d_state)
+    model = HMTR_Stage1_AutoEncoder(vocab_size, dim; block_size=meta.block_size, pad_id=meta.pad_id, eos_id=meta.eos_id, mamba_d_state=mamba_d_state)
 
     dev = select_device(cfg.force_cpu)
     cpu = cpu_device()

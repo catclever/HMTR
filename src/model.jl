@@ -6,6 +6,8 @@ using NNlib
 using Zygote
 using CUDA
 using LuxCUDA
+import ChainRulesCore
+import ChainRulesCore
 
 export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, NanoDecoder, HMTR_Stage1_AutoEncoder
 
@@ -85,7 +87,7 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
     d_model, L, batch = size(x)
     d_state = size(A, 2)
     h = similar(x, d_model, d_state, batch)
-    Zygote.@ignore fill!(h, zero(eltype(h)))
+    fill!(h, zero(eltype(h)))
 
     D2 = reshape(D, d_model, 1)
     A2 = reshape(A, d_model, d_state, 1)
@@ -93,7 +95,7 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
     if L == 0
         return similar(x, d_model, 0, batch)
     end
-    ys = Zygote.Buffer(x, d_model, L, batch)
+    ys = similar(x, d_model, L, batch)
 
     dt_min = 1f-4
     dt_scale = 0.1f0
@@ -112,10 +114,134 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
         h = h .* decay .+ (B3 .* dt3) .* xt3
 
         y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
-        ys[:, t:t, :] = reshape(y, d_model, 1, batch)
+        @views ys[:, t, :] .= y
     end
 
-    return copy(ys)
+    return ys
+end
+
+function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
+    d_model, L, batch = size(x)
+    d_state = size(A, 2)
+    h = similar(x, d_model, d_state, batch)
+    fill!(h, zero(eltype(h)))
+
+    D2 = reshape(D, d_model, 1)
+    A2 = reshape(A, d_model, d_state, 1)
+
+    ys = similar(x, d_model, L, batch)
+    hs = similar(x, d_model, d_state, batch, L)
+
+    dt_min = 1f-4
+    dt_scale = 0.1f0
+    for t in 1:L
+        xt = @view x[:, t, :]
+        dt = NNlib.softplus.(@view dt_raw[:, t, :]) .* dt_scale .+ dt_min
+        Bt = @view B_raw[:, t, :]
+        Ct = @view C_raw[:, t, :]
+
+        dt3 = reshape(dt, d_model, 1, batch)
+        xt3 = reshape(xt, d_model, 1, batch)
+        B3 = reshape(Bt, 1, d_state, batch)
+        C3 = reshape(Ct, 1, d_state, batch)
+
+        decay = exp.(A2 .* dt3)
+        h .= h .* decay .+ (B3 .* dt3) .* xt3
+
+        y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
+        @views ys[:, t, :] .= y
+        @views hs[:, :, :, t] .= h
+    end
+
+    return ys, hs
+end
+
+function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D)
+    y, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
+
+    function pullback(ȳ)
+        if ȳ isa ChainRulesCore.AbstractZero
+            return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent())
+        end
+
+        d_model, L, batch = size(x)
+        d_state = size(A, 2)
+
+        dx = similar(x)
+        fill!(dx, zero(eltype(dx)))
+        ddt_raw = similar(dt_raw)
+        fill!(ddt_raw, zero(eltype(ddt_raw)))
+        dB_raw = similar(B_raw)
+        fill!(dB_raw, zero(eltype(dB_raw)))
+        dC_raw = similar(C_raw)
+        fill!(dC_raw, zero(eltype(dC_raw)))
+        dA = similar(A)
+        fill!(dA, zero(eltype(dA)))
+        dD = similar(D)
+        fill!(dD, zero(eltype(dD)))
+
+        D2 = reshape(D, d_model, 1)
+        A2 = reshape(A, d_model, d_state, 1)
+
+        h0 = similar(hs, d_model, d_state, batch)
+        fill!(h0, zero(eltype(h0)))
+
+        gh = similar(h0)
+        fill!(gh, zero(eltype(gh)))
+        gdecay = similar(h0)
+        gudt = similar(x, d_model, batch)
+        gdt = similar(x, d_model, batch)
+
+        dt_min = 1f-4
+        dt_scale = 0.1f0
+
+        for t in L:-1:1
+            xt = x[:, t, :]
+            dt_raw_t = dt_raw[:, t, :]
+            Bt = B_raw[:, t, :]
+            Ct = C_raw[:, t, :]
+            dt = NNlib.softplus.(dt_raw_t) .* dt_scale .+ dt_min
+
+            dt3 = reshape(dt, d_model, 1, batch)
+            xt3 = reshape(xt, d_model, 1, batch)
+            B3 = reshape(Bt, 1, d_state, batch)
+            C3 = reshape(Ct, 1, d_state, batch)
+
+            h_prev = t == 1 ? h0 : hs[:, :, :, t - 1]
+            h_t = hs[:, :, :, t]
+
+            decay = exp.(A2 .* dt3)
+
+            ȳt = ȳ[:, t, :]
+
+            gh .+= reshape(ȳt, d_model, 1, batch) .* C3
+
+            @views dC_raw[:, t, :] .+= dropdims(sum(h_t .* reshape(ȳt, d_model, 1, batch); dims=1); dims=1)
+            dx[:, t, :] .+= ȳt .* D2
+            dD .+= vec(dropdims(sum(ȳt .* xt; dims=2); dims=2))
+
+            gdecay .= gh .* h_prev
+
+            gudt .= dropdims(sum(gh .* (dt3 .* B3); dims=2); dims=2)
+            dx[:, t, :] .+= gudt
+
+            gdt .= dropdims(sum(gh .* (xt3 .* B3); dims=2); dims=2)
+            @views dB_raw[:, t, :] .+= dropdims(sum(gh .* (xt3 .* dt3); dims=1); dims=1)
+
+            gdt .+= dropdims(sum(gdecay .* (A2 .* decay); dims=2); dims=2)
+            dA .+= dropdims(sum(gdecay .* (reshape(dt, d_model, 1, batch) .* decay); dims=3); dims=3)
+
+            ddt_raw[:, t, :] .+= gdt .* (dt_scale .* NNlib.sigmoid.(dt_raw_t))
+
+            gh .= gh .* decay
+        end
+
+        return (ChainRulesCore.NoTangent(), dx, ddt_raw, dB_raw, dC_raw, dA, dD)
+    end
+
+    return y, pullback
 end
 
 function (l::SimplifiedMambaBlock)(x, ps, st)
@@ -185,20 +311,20 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     seq_len = size(hidden, 2)
     B = size(hidden, 3)
 
-    is_eos = x .== m.eos_id
-    eos_cum = cumsum(Int.(is_eos); dims=1)
-    mask_first_eos = (eos_cum .== 1) .& is_eos
-    has_eos = any(is_eos; dims=1)
+    stride = max(m.block_size, 1)
+    Lpad = (seq_len % stride == 0) ? seq_len : (seq_len + (stride - (seq_len % stride)))
+    Lcap = Lpad ÷ stride
 
-    is_nonpad = x .!= m.pad_id
-    rev = reverse(is_nonpad; dims=1)
-    rev_cum = cumsum(Int.(rev); dims=1)
-    mask_rev = (rev_cum .== 1) .& rev
-    mask_last = reverse(mask_rev; dims=1)
+    hidden_pad = if Lpad == seq_len
+        hidden
+    else
+        pad_part = similar(hidden, size(hidden, 1), Lpad - seq_len, B)
+        Zygote.@ignore fill!(pad_part, zero(eltype(pad_part)))
+        cat(hidden, pad_part; dims=2)
+    end
 
-    mask = mask_first_eos .| ((.!has_eos) .& mask_last)
-    mask_f = Float32.(mask)
-    capsules = sum(hidden .* reshape(mask_f, 1, seq_len, B); dims=2)
+    hidden4 = reshape(hidden_pad, size(hidden_pad, 1), stride, Lcap, B)
+    capsules = @view hidden4[:, stride, :, :]
 
     return capsules, (embedding=st_emb, layers=st_layers)
 end
@@ -247,6 +373,83 @@ function (r::LatentReasoner)(x, ps, st)
 end
 
 
+# --- 3. Nano Decoder ---
+
+struct NanoDecoder{E,C,P} <: Lux.AbstractLuxLayer
+    embedding::E
+    cell::C
+    proj::P
+    dim::Int
+    block_size::Int
+    eos_id::Int
+end
+
+function NanoDecoder(vocab_size::Int, dim::Int, block_size::Int=8; eos_id::Int=2)
+    embedding = Embedding(vocab_size => dim)
+    cell = GRUCell(dim => dim)
+    proj = Dense(dim => vocab_size)
+    return NanoDecoder(embedding, cell, proj, dim, block_size, eos_id)
+end
+
+Lux.initialparameters(rng::AbstractRNG, d::NanoDecoder) = (
+    embedding=Lux.initialparameters(rng, d.embedding),
+    cell=Lux.initialparameters(rng, d.cell),
+    proj=Lux.initialparameters(rng, d.proj),
+)
+
+Lux.initialstates(rng::AbstractRNG, d::NanoDecoder) = (
+    embedding=Lux.initialstates(rng, d.embedding),
+    cell=Lux.initialstates(rng, d.cell),
+    proj=Lux.initialstates(rng, d.proj),
+)
+
+function (d::NanoDecoder)(capsules, tokens::AbstractMatrix{Int}, ps, st; start_id::Int=d.eos_id)
+    D, _, B = size(capsules)
+    K = max(d.block_size, 1)
+
+    L = size(tokens, 1)
+    Lpad = (L % K == 0) ? L : (L + (K - (L % K)))
+    Lcap2 = Lpad ÷ K
+
+    tokens_pad = if Lpad == L
+        tokens
+    else
+        pad_part = similar(tokens, Lpad - L, B)
+        Zygote.@ignore fill!(pad_part, d.eos_id)
+        cat(tokens, pad_part; dims=1)
+    end
+
+    t3 = reshape(tokens_pad, K, Lcap2, B)
+
+    N = Lcap2 * B
+    h = reshape(capsules, D, N)
+
+    vocab_size = size(ps.proj.weight, 1)
+
+    start_ids = similar(tokens_pad, N)
+    Zygote.@ignore fill!(start_ids, start_id)
+
+    st_emb = st.embedding
+    st_cell = st.cell
+    st_proj = st.proj
+
+    logits_steps = ()
+    for k in 1:K
+        prev_ids = k == 1 ? start_ids : copy(reshape(@view(t3[k - 1, :, :]), N))
+        x_in, st_emb = d.embedding(prev_ids, ps.embedding, st_emb)
+        (out, (h_new,)), st_cell = d.cell((x_in, (h,)), ps.cell, st_cell)
+        h = h_new
+        logits, st_proj = d.proj(out, ps.proj, st_proj)
+        logits_steps = (logits_steps..., reshape(logits, vocab_size, 1, N))
+    end
+
+    out_buf = cat(logits_steps...; dims=2)
+    out4 = reshape(out_buf, vocab_size, K, Lcap2, B)
+    out_seq = reshape(out4, vocab_size, Lpad, B)
+
+    return out_seq[:, 1:L, :], (embedding=st_emb, cell=st_cell, proj=st_proj)
+end
+
 # --- 3. Mamba Decoder ---
 
 struct MambaDecoder{E,L,P} <: Lux.AbstractLuxLayer
@@ -282,6 +485,43 @@ Lux.initialstates(rng::AbstractRNG, d::MambaDecoder) = (
     proj=Lux.initialstates(rng, d.proj)
 )
 
+function sinusoidal_position_encoding(like, D::Int, L::Int)
+    T = eltype(like)
+    half = D ÷ 2
+
+    positions_cpu = reshape(collect(0:(L - 1)), 1, L)
+    div_idx_cpu = reshape(collect(0:(half - 1)), half, 1)
+
+    positions = positions_cpu
+    div_idx = div_idx_cpu
+    if like isa Union{CUDA.CuArray, CUDA.CuDeviceArray}
+        positions = CUDA.CuArray(positions_cpu)
+        div_idx = CUDA.CuArray(div_idx_cpu)
+    end
+
+    positions = T.(positions)
+    div_idx = T.(div_idx)
+
+    scale = -log(T(10000)) * (T(2) / T(D))
+    div_term = exp.(div_idx .* scale)
+    angles = div_term .* positions
+
+    pe = similar(like, T, D, L)
+    if half > 0
+        sin_part = sin.(angles)
+        cos_part = cos.(angles)
+        @views pe[1:2:(2 * half), :] .= sin_part
+        @views pe[2:2:(2 * half), :] .= cos_part
+    end
+    if 2 * half < D
+        @views pe[(2 * half + 1):D, :] .= zero(T)
+    end
+
+    return reshape(pe, D, L, 1)
+end
+
+Zygote.@nograd sinusoidal_position_encoding
+
 function (d::MambaDecoder)(capsules, ps, st; target_len::Int)
     # capsules: [Dim, 1, Batch] (or [Dim, N_capsules, Batch])
     # For Stage 1 AutoEncoder with Bucketing strategy, we typically have 1 capsule per sentence?
@@ -301,9 +541,12 @@ function (d::MambaDecoder)(capsules, ps, st; target_len::Int)
 
     # Using Zygote-friendly repeat/broadcast
     # latents_expanded = repeat(capsules, 1, target_len, 1) # This might be inefficient or not supported well in all AD?
-    # Broadcast approach:
-    # capsules is [D, 1, B]. We want [D, L, B].
-    latents_expanded = capsules .+ zeros(Float32, D, target_len, B)
+    Lcap = size(capsules, 2)
+    rep = cld(target_len, Lcap)
+    latents_expanded = repeat(capsules; inner=(1, rep, 1))
+    latents_expanded = @view latents_expanded[:, 1:target_len, :]
+    pos = sinusoidal_position_encoding(capsules, D, target_len)
+    latents_expanded = latents_expanded .+ pos
 
     # Pass through Mamba layers
     features, st_layers = d.layers(latents_expanded, ps.layers, st.layers)
@@ -326,13 +569,13 @@ struct HMTR_Stage1_AutoEncoder{E,N,D} <: Lux.AbstractLuxLayer
     decoder::D
 end
 
-function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
+function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
     # Encoder: block_size isn't strictly enforced in forward but kept in struct. 
     # We remove block_size dependency for MambaCompressor's ctor logic if it was just for struct.
     # But MambaCompressor defined in code has block_size. We pass 0 or a dummy if not used for striding.
-    enc = MambaCompressor(vocab_size, dim, 0; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
+    enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
     norm = FeatureLayerNorm(dim)
-    dec = MambaDecoder(vocab_size, dim; eos_id=eos_id, mamba_d_state=mamba_d_state)
+    dec = NanoDecoder(vocab_size, dim, block_size; eos_id=eos_id)
     return HMTR_Stage1_AutoEncoder(enc, norm, dec)
 end
 
@@ -361,7 +604,7 @@ function (m::HMTR_Stage1_AutoEncoder)(x, ps, st; kwargs...)
     capsules_norm, st_norm = m.norm(capsules, ps.norm, st.norm)
 
     # Pass target_len = L to decoder
-    logits, st_dec = m.decoder(capsules_norm, ps.decoder, st.decoder; target_len=L)
+    logits, st_dec = m.decoder(capsules_norm, x, ps.decoder, st.decoder; start_id=m.encoder.eos_id)
 
     return logits, (encoder=st_enc, norm=st_norm, decoder=st_dec)
 end
