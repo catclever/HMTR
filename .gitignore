@@ -11,5 +11,6 @@ data/
 *.log
 *.swp
 *.swo
-*~
+.vscode
 .DS_Store
+

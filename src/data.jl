@@ -4,6 +4,9 @@ using Parquet2
 using DataFrames
 using JLD2
 using Random
+if get(ENV, "JULIA_PYTHONCALL_EXE", "") == ""
+    ENV["JULIA_PYTHONCALL_EXE"] = "python3"
+end
 using PythonCall
 using Dates
 using ..Utils
