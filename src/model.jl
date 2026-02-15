@@ -13,6 +13,15 @@ export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, 
 
 hippo_A_diag(d_state::Int, ::Type{T}=Float32) where {T<:AbstractFloat} = -(T.(collect(1:d_state)))
 
+function reparameterize(μ, logvar; rng=Random.default_rng(), training=true)
+    if !training
+        return μ
+    end
+    σ = exp.(0.5f0 .* logvar)
+    ε = randn(rng, eltype(μ), size(μ))
+    return μ .+ σ .* ε
+end
+
 struct FeatureLayerNorm <: Lux.AbstractLuxLayer
     dim::Int
     epsilon::Float32
@@ -266,9 +275,10 @@ end
 
 # --- 1. Mamba Encoder ---
 
-struct MambaCompressor{L<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
+struct MambaCompressor{L<:Lux.AbstractLuxLayer, H<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
     embedding::Lux.Embedding
     layers::L
+    head::H
     block_size::Int
     dim::Int
     pad_id::Int
@@ -283,17 +293,21 @@ function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::I
         SimplifiedMambaBlock(dim, mamba_d_state),
         SimplifiedMambaBlock(dim, mamba_d_state)
     )
-    return MambaCompressor(Embedding(vocab_size => dim), layers, block_size, dim, pad_id, eos_id)
+    # VAE Head: Project to 2 * dim (mu, logvar)
+    head = Dense(dim => dim * 2)
+    return MambaCompressor(Embedding(vocab_size => dim), layers, head, block_size, dim, pad_id, eos_id)
 end
 
 Lux.initialparameters(rng::AbstractRNG, m::MambaCompressor) = (
     embedding=Lux.initialparameters(rng, m.embedding),
-    layers=Lux.initialparameters(rng, m.layers)
+    layers=Lux.initialparameters(rng, m.layers),
+    head=Lux.initialparameters(rng, m.head)
 )
 
 Lux.initialstates(rng::AbstractRNG, m::MambaCompressor) = (
     embedding=Lux.initialstates(rng, m.embedding),
-    layers=Lux.initialstates(rng, m.layers)
+    layers=Lux.initialstates(rng, m.layers),
+    head=Lux.initialstates(rng, m.head)
 )
 
 function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
@@ -324,9 +338,28 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     end
 
     hidden4 = reshape(hidden_pad, size(hidden_pad, 1), stride, Lcap, B)
-    capsules = @view hidden4[:, stride, :, :]
+    # Pool: Take the last token of each block as the summary
+    pooled = @view hidden4[:, stride, :, :]
+    
+    # helper for view preservation and batching
+    s = size(pooled)
+    # s is (Dim, Lcap, B)
+    pooled_flat = reshape(pooled, s[1], s[2] * s[3])
+    
+    # Project to VAE params
+    # pooled_flat: [Dim, Lcap * B]
+    vae_out_flat, st_head = m.head(pooled_flat, ps.head, st.head)
+    # vae_out_flat: [2*Dim, Lcap * B]
+    
+    # Reshape back to [2*Dim, Lcap, B]
+    vae_out = reshape(vae_out_flat, :, s[2], s[3])
+    
+    # Split into mu and logvar
+    # We assume dim 1 is 2*Dim
+    mu = @view vae_out[1:m.dim, :, :]
+    logvar = @view vae_out[m.dim+1:end, :, :]
 
-    return capsules, (embedding=st_emb, layers=st_layers)
+    return (mu, logvar), (embedding=st_emb, layers=st_layers, head=st_head)
 end
 
 # --- 2. Transformer Reasoner ---
@@ -600,13 +633,25 @@ function (m::HMTR_Stage1_AutoEncoder)(x, ps, st; kwargs...)
     # Get target length from input x
     L, B = size(x)
 
-    capsules, st_enc = m.encoder(x, ps.encoder, st.encoder)
-    capsules_norm, st_norm = m.norm(capsules, ps.norm, st.norm)
+    capsules_params, st_enc = m.encoder(x, ps.encoder, st.encoder)
+    mu, logvar = capsules_params
+    
+    # Reparameterize
+    # training=true by default in training loop, we can control via kwargs if needed but Lux doesn't pass it standardly here.
+    # We use Zygote.ignore or just randn.
+    # Lux.apply doesn't expose a clean "training" flag in signature usually, it's implicit or passed in st.
+    # For simplicity, we assume always training/stochastic in this call, or control variance externaly?
+    # Better: just Sample.
+    
+    # For sampling, we need randomness. Zygote ignores non-differentiable randomness, so we can use standard RNG or CUDA RNG.
+    z = reparameterize(mu, logvar)
+    
+    capsules_norm, st_norm = m.norm(z, ps.norm, st.norm)
 
     # Pass target_len = L to decoder
     logits, st_dec = m.decoder(capsules_norm, x, ps.decoder, st.decoder; start_id=m.encoder.eos_id)
 
-    return logits, (encoder=st_enc, norm=st_norm, decoder=st_dec)
+    return (logits, mu, logvar), (encoder=st_enc, norm=st_norm, decoder=st_dec)
 end
 
 end # module Model
