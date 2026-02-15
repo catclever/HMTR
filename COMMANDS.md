@@ -49,6 +49,8 @@ HMTR.main(["data", "--max-docs", "1000", "--parquet-file", "./data/wiki_filtered
 
 ### 🏋️ 训练 Stage 1 (AutoEncoder w/ Mamba Decoder)
 
+使用 VE 版本时，将命令中的 `train_stage1` 替换为 `train_stage1_ve` 或 `train_ve`。
+
 #### ⚡ 快速测试 (Debug Run)
 用于验证代码逻辑，跑少量 Batch。
 ```julia
@@ -134,6 +136,8 @@ HMTR.main([
 ```
 
 ### 🤖 推理 (Inference)
+
+使用 VE 版本时，将命令中的 `infer_stage1` 替换为 `infer_stage1_ve` 或 `infer_ve`。
 
 #### 💬 交互模式
 启动后可以直接在 REPL 中输入文本查看重构结果。

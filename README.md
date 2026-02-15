@@ -1,43 +1,84 @@
-# H-M-T-R Project
+# H-M-T-R 项目 / Project
+
+基于 Julia 的 Hierarchical Mamba-Transformer-RNN 架构实现。
+（说明：Stage 1 当前使用 **GRU-based NanoDecoder（RNN）**，尚未切换为 Mamba Decoder。）
 
 Hierarchical Mamba-Transformer-RNN Architecture implementation in Julia.
-(Note: Stage 1 now uses **Mamba Decoder** instead of RNN, achieving a fully Mamba-based AutoEncoder).
+(Note: Stage 1 currently uses **GRU-based NanoDecoder (RNN)**, not Mamba Decoder.)
 
-## Project Structure
+## 项目结构 / Project Structure
 
-- `hmtr.jl`: **Unified Entry Point**.
-- `src/HMTR.jl`: Main module.
-- `src/model.jl`: Defines the core components (MambaCompressor, MambaDecoder) and the `HMTR_Stage1_AutoEncoder`.
-- `src/train_stage1.jl`: Training logic for Stage 1 (AutoEncoder with Bucketing strategy).
-- `src/infer_stage1.jl`: Inference logic for Stage 1.
-- `src/data.jl`: Data preprocessing logic (Parquet -> JLD2 with Length Bucketing).
-- `data/`: Directory for datasets.
+- `hmtr.jl`: 统一入口 / Unified entry point.
+- `src/HMTR.jl`: 主模块 / Main module.
+- `src/model.jl`: 核心组件与 `HMTR_Stage1_AutoEncoder` / Core components and `HMTR_Stage1_AutoEncoder`.
+- `src/train_stage1.jl`: Stage 1 训练逻辑（含分桶）/ Stage 1 training logic (bucketing).
+- `src/infer_stage1.jl`: Stage 1 推理逻辑 / Stage 1 inference logic.
+- `src/ve_model.jl`: VE 版本模型实现 / VE model implementation.
+- `src/ve_train_stage1.jl`: VE 版本 Stage 1 训练 / VE Stage 1 training.
+- `src/ve_infer_stage1.jl`: VE 版本 Stage 1 推理 / VE Stage 1 inference.
+- `src/data.jl`: 数据预处理（Parquet -> JLD2 + 分桶）/ Data preprocessing (Parquet -> JLD2 + bucketing).
+- `data/`: 数据集目录 / Dataset directory.
 
-## Quick Start
-1. **Setup**:
+## 快速开始 / Quick Start
+1. **环境准备 / Setup**:
+   安装 Julia 并初始化依赖：
    Ensure Julia is installed. Then instantiate the project:
    ```bash
    julia --project=. -e 'using Pkg; Pkg.instantiate()'
    ```
 
-2. **Run Training**:
+2. **开始训练 / Run Training**:
    ```bash
    julia --project=. hmtr.jl train_stage1
    ```
+   ```bash
+   julia --project=. hmtr.jl train_stage1_ve
+   ```
 
-See [COMMANDS.md](COMMANDS.md) for detailed usage instructions.
+详细参数与示例请参考 / See [COMMANDS.md](COMMANDS.md).
 
-## Stage 1: AutoEncoder
+## REPL 指引 / REPL Guide
 
-Objective: Train the Mamba Encoder to compress text into "capsules" and the Mamba Decoder to reconstruct it.
+建议在项目根目录启动 REPL，配合 Revise 热重载：
+Start REPL at project root with Revise hot reload:
 
-- **Input**: Token sequences (Variable lengths, bucketed into 8, 16, 32, 64, 128).
-- **Model**: `MambaCompressor` -> `Capsules` -> `MambaDecoder`.
-- **Loss**: Reconstruction CrossEntropy.
+```julia
+using Revise
+includet("src/HMTR.jl")
+using .HMTR
+```
 
-## Next Steps (Stage 2)
+之后可以直接调用：
+Then run commands directly:
 
+```julia
+HMTR.main(["lint"])
+HMTR.main(["typecheck"])
+HMTR.main(["train_stage1", "--data-file", "data/processed_char_buckets_20260109_140845.jld2"])
+```
+
+如果 Revise 不稳定，可使用：
+If Revise is unstable, use:
+
+```julia
+include("hmtr.jl")
+```
+
+更多参数示例请参考 / See [COMMANDS.md](COMMANDS.md).
+
+## Stage 1：AutoEncoder / Stage 1: AutoEncoder
+
+目标：训练 Mamba Encoder 将文本压缩为 capsules，并由 Mamba Decoder 重构。
+Objective: Train the Mamba Encoder to compress text into capsules and the Mamba Decoder to reconstruct it.
+
+- **输入 / Input**: 变长序列，分桶 8/16/32/64/128。
+- **模型 / Model**: `MambaCompressor` -> `Capsules` -> `NanoDecoder (GRU)`.
+- **损失 / Loss**: 重构交叉熵 / Reconstruction CrossEntropy.
+
+## 下一步（Stage 2）/ Next Steps (Stage 2)
+
+当 Stage 1 收敛后：
 Once Stage 1 loss converges:
-1. Freeze `Encoder` and `Decoder`.
-2. Extract capsules for the whole dataset.
-3. Train `LatentReasoner` (Transformer) to predict the next capsule.
+1. 冻结 `Encoder` 与 `Decoder` / Freeze `Encoder` and `Decoder`.
+2. 提取全量 capsules / Extract capsules for the whole dataset.
+3. 训练 `LatentReasoner` 预测下一 capsule / Train `LatentReasoner` to predict the next capsule.

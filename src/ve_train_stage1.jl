@@ -1,4 +1,4 @@
-module TrainStage1
+module VETrainStage1
 
 using Lux
 using Random
@@ -11,9 +11,8 @@ using CUDA
 using LuxCUDA
 import ChainRulesCore
 using Dates
-using Statistics
 using ..Utils
-using ..Model
+using ..VEModel
 
 export train_stage1
 
@@ -21,7 +20,7 @@ const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 const DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
 const DATA_FILE = get(ENV, "DATA_FILE", joinpath(DATA_DIR, "processed.jld2"))
 const META_FILE = get(ENV, "META_FILE", "")
-const CHECKPOINT_DIR = get(ENV, "CHECKPOINT_DIR", joinpath(PROJECT_ROOT, "checkpoints"))
+const CHECKPOINT_DIR = get(ENV, "CHECKPOINT_DIR", joinpath(PROJECT_ROOT, "ve-ckpt"))
 const CHECKPOINT_PREFIX = get(ENV, "CHECKPOINT_PREFIX", "ckpt_stage1")
 const EPOCHS = parse(Int, get(ENV, "EPOCHS", "5"))
 const BATCH_SIZE = parse(Int, get(ENV, "BATCH_SIZE", "32"))
@@ -33,7 +32,6 @@ const GRAD_CLIP_NORM = parse(Float64, get(ENV, "GRAD_CLIP_NORM", "5.0"))
 const LOSS_SPIKE_THRESHOLD = parse(Float64, get(ENV, "LOSS_SPIKE_THRESHOLD", "10.0"))
 const SKIP_ON_SPIKE = parse(Int, get(ENV, "SKIP_ON_SPIKE", "1"))
 const WARMUP_STEPS = parse(Int, get(ENV, "WARMUP_STEPS", "500"))
-const KL_WEIGHT = parse(Float64, get(ENV, "KL_WEIGHT", "0.0001"))
 
 const PRETRAIN_EMB_FILE = get(ENV, "PRETRAIN_EMB_FILE", "")
 const INSPECT_DATA = parse(Int, get(ENV, "INSPECT_DATA", "0"))
@@ -116,7 +114,6 @@ function resolve_config(cli::Dict{Symbol,Any})
 
     inspect_n = parse(Int, string(get(cli, :inspect_n, INSPECT_N)))
     warmup_steps = parse(Int, string(get(cli, :warmup_steps, WARMUP_STEPS)))
-    kl_weight = parse(Float64, string(get(cli, :kl_weight, KL_WEIGHT)))
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
     encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
@@ -191,7 +188,6 @@ function resolve_config(cli::Dict{Symbol,Any})
         norm_dtype,
         decoder_dtype,
         warmup_steps,
-        kl_weight,
     )
 end
 
@@ -448,16 +444,15 @@ function print_training_samples(x::AbstractMatrix{Int}, vocab, pad_id::Int, eos_
     return
 end
 
-function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int, kl_weight::Float32=0f0)
-    # Forward pass now returns (logits, mu, logvar)
-    (y_pred, mu, logvar), st_new = model(x_batch, ps, st)
-    
-    L, B = size(x_batch)
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int)
+    capsules, st_enc = model.encoder(x_batch, ps.encoder, st.encoder)
+    capsules_norm, st_norm = model.norm(capsules, ps.norm, st.norm)
 
-    # Note: st_new is already structured (encoder, norm, decoder) inside the calls 
-    # but model(...) returns the composite st. 
-    # model(x, ps, st) in model.jl line 609 returns (logits, mu, logvar), (encoder=..., norm=..., decoder=...)
-    # So we are good.
+    # Decoder needs target length. For AutoEncoder, target len = input len.
+    L, B = size(x_batch)
+    y_pred, st_dec = model.decoder(capsules_norm, y_batch, ps.decoder, st.decoder; start_id=start_id)
+
+    st_new = (encoder=st_enc, norm=st_norm, decoder=st_dec)
 
     vocab_size = size(y_pred, 1)
     K = max(getfield(model.decoder, :block_size), 1)
@@ -496,22 +491,9 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::In
     num = dropdims(sum((-picked3) .* weights3; dims=(1, 3)); dims=(1, 3))
     den = dropdims(sum(weights3; dims=(1, 3)); dims=(1, 3))
     per_chunk = num ./ max.(den, 1f0)
-    recon_loss = sum(per_chunk) / max(Float32(length(per_chunk)), 1f0)
+    loss = sum(per_chunk) / max(Float32(length(per_chunk)), 1f0)
 
-    # KL Divergence Loss
-    # kl = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
-    # dim=1 is feature dim? mu: [Dim, Lcap, B]
-    # We averge over Batch and Length, and Sum over Dim? 
-    # Or Sum over Dim, Mean over Batch/Length.
-    # Usually KL is per sample.
-    
-    kl_per_element = -0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- exp.(logvar))
-    # Sum over dimensions, Mean over batch/capsules
-    kl_loss = mean(sum(kl_per_element; dims=1))
-
-    total_loss = recon_loss + kl_weight * kl_loss
-
-    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss)
+    return loss, st_new, (;)
 end
 
 function select_device()
@@ -735,8 +717,8 @@ function train(cfg)
             y_batch = x_batch
 
             # Gradient
-            (loss, st_new, internals), back = Zygote.pullback(
-                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id, kl_weight=Float32(cfg.kl_weight)), ps
+            (loss, st_new, _), back = Zygote.pullback(
+                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id), ps
             )
 
             loss_val = Float32(loss)
@@ -767,7 +749,7 @@ function train(cfg)
             train_step += 1
 
             if i % 50 == 0
-                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f) | LR: %.2e\n" epoch i num_batches loss_val internals.recon internals.kl current_lr
+                @printf "Epoch %d [%d/%d] Loss: %.4f | LR: %.2e (Target: %.2e)\n" epoch i num_batches loss_val current_lr target_lr
             end
 
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
@@ -839,7 +821,7 @@ end
 
 function train_stage1(args::Vector{String})
     if "--help" in args || "-h" in args
-        println("Usage: train_stage1 [options]")
+        println("Usage: train_stage1_ve [options]")
         println("Options:")
         println("  --data-file <path>        Path to processed data file (default: \$DATA_FILE)")
         println("  --meta-file <path>        Path to metadata file (default: derived from data-file)")
