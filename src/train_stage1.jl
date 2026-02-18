@@ -47,6 +47,7 @@ const ENCODER_DTYPE = get(ENV, "ENCODER_DTYPE", "")
 const NORM_DTYPE = get(ENV, "NORM_DTYPE", "")
 const DECODER_DTYPE = get(ENV, "DECODER_DTYPE", "")
 const RESUME_CKPT = get(ENV, "RESUME_CKPT", "")
+const SEQ_LEN = parse(Int, get(ENV, "SEQ_LEN", "1024"))
 
 function parse_ckpt_epoch_step(path::AbstractString)
     base = basename(path)
@@ -124,6 +125,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
     norm_dtype = string(get(cli, :norm_dtype, NORM_DTYPE))
     decoder_dtype = string(get(cli, :decoder_dtype, DECODER_DTYPE))
+    seq_len = parse(Int, string(get(cli, :seq_len, SEQ_LEN)))
 
     resume_ckpt = string(get(cli, :resume_ckpt, get(cli, :resume, get(cli, :resume_from, RESUME_CKPT))))
     if resume_ckpt == "true"
@@ -195,6 +197,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         warmup_steps,
         kl_weight,
         pred_weight,
+        seq_len,
     )
 end
 
@@ -789,14 +792,14 @@ function train(cfg)
     start_id = eos_id
 
     # Initialize Iterator
-    SEQ_LEN = parse(Int, get(ENV, "SEQ_LEN", "1024"))
+    seq_len = cfg.seq_len
     
     local batches
     local num_batches_per_epoch
     local stream_iter
 
     if is_stream
-        stream_iter = StreamBatchIterator(data_content, reset_flags, cfg.batch_size, SEQ_LEN)
+        stream_iter = StreamBatchIterator(data_content, reset_flags, cfg.batch_size, seq_len)
         if cfg.max_batches > 0
             batches = Iterators.take(stream_iter, cfg.max_batches)
             num_batches_per_epoch = min(length(stream_iter), cfg.max_batches)
@@ -992,6 +995,7 @@ function train_stage1(args::Vector{String})
         println("  --dim <int>               Model dimension")
         println("  --mamba-d-state <int>     Mamba d_state (default: $MAMBA_D_STATE)")
         println("  --warmup-steps <int>      Warmup steps (default: $WARMUP_STEPS)")
+        println("  --seq-len <int>           Stream chunk length (default: $SEQ_LEN)")
         println("  --inspect-data            Inspect data instead of training")
         return
     end
