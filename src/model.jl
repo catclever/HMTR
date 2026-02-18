@@ -386,7 +386,8 @@ Lux.initialstates(rng::AbstractRNG, p::LatentPredictor) = (layers=Lux.initialsta
 
 function (p::LatentPredictor)(z::AbstractArray, ps, st)
     # z: [Dim, B] or [Dim, N, B]
-    return p.layers(z, ps.layers, st.layers)
+    y, st_layers = p.layers(z, ps.layers, st.layers)
+    return y, (layers=st_layers,)
 end
 
 # --- 3. Transformer Reasoner (Optional Future) ---

@@ -513,8 +513,17 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::In
 
     # 2. KL Divergence Loss
     kl_per_element = -0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- exp.(logvar))
-    kl_loss = mean(sum(kl_per_element; dims=1))
+    # Sum over dim, mean over batch
+    kl_per_dim = mean(sum(kl_per_element; dims=1)) # Scaler: average KL per sample
+    kl_loss = kl_per_dim
 
+    # --- Monitoring Metrics (No Gradient) ---
+    var = exp.(logvar)
+    mean_var = mean(var)
+    
+    kl_dim_vector = mean(-0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- var); dims=(2,3)) 
+    # The dimensions of logvar are [Dim, N_capsules, Batch] -> dims=(2,3) averages over N and B
+    
     # 3. Latent Predictive Loss (JEPA)
     # Task: z_pred[t] should predict z[t+1]
     # z: [Dim, Lcap, B]
@@ -532,7 +541,7 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::In
 
     total_loss = recon_loss + kl_weight * kl_loss + pred_weight * pred_loss
 
-    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss)
+    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss, var=mean_var, kl_dim_vector=Zygote.dropgrad(kl_dim_vector))
 end
 
 function select_device()
@@ -869,6 +878,8 @@ function train(cfg)
             )
 
             loss_val = Float32(loss)
+            
+            # Check for loss spike / NaN
             spike = !(isfinite(loss_val)) || (loss_val > Float32(cfg.loss_spike_threshold))
             if spike
                 stats = batch_stats(x_batch, vocab_size, pad_id, eos_id)
@@ -896,7 +907,8 @@ function train(cfg)
             train_step += 1
 
             if i % 50 == 0
-                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f | Pred: %.4f) | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.recon internals.kl internals.pred current_lr
+                au = count(internals.kl_dim_vector .> 0.01f0)
+                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f | Pred: %.4f) | Var: %.4f | AU: %d | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.recon internals.kl internals.pred internals.var au current_lr
             end
 
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
