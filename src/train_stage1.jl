@@ -549,18 +549,23 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::In
     # Shift: z_target = z[:, 2:end, :]
     #        z_pred_in = z_pred[:, 1:end-1, :]
     # If Lcap=1, we can't do this loss (need sequence).
-    pred_loss = 0f0
     if Lcap > 1
         z_target = Zygote.dropgrad(z[:, 2:end, :]) # Stop gradient on target
         z_p = z_pred[:, 1:end-1, :]
         
         diff = z_p .- z_target
-        pred_loss = mean(sum(abs2, diff; dims=1))
+        # Normalize by dimension (mean instead of sum) to keep loss scale independent of dim
+        # and comparable to reconstruction loss.
+        pred_loss = mean(mean(abs2, diff; dims=1))
     end
 
     total_loss = recon_loss + kl_weight * kl_loss + pred_weight * pred_loss
+    
+    # metrics
+    z_mean_val = mean(mu)
+    z_std_val = mean(exp.(0.5f0 .* logvar))
 
-    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss, var=mean_var, kl_dim_vector=Zygote.dropgrad(kl_dim_vector))
+    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss, var=mean_var, z_mean=z_mean_val, z_std=z_std_val, kl_dim=Zygote.dropgrad(kl_dim_vector))
 end
 
 function select_device()
@@ -926,8 +931,8 @@ function train(cfg)
             train_step += 1
 
             if i % 50 == 0
-                au = count(internals.kl_dim_vector .> 0.01f0)
-                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f | Pred: %.4f) | Var: %.4f | AU: %d | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.recon internals.kl internals.pred internals.var au current_lr
+                au = count(internals.kl_dim .> 0.01f0)
+                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f | Pred: %.4f) | Var: %.4f | z_μ: %.4f | z_σ: %.4f | AU: %d | |g|: %.4f | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.recon internals.kl internals.pred internals.var internals.z_mean internals.z_std au grad_norm current_lr
             end
 
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
