@@ -15,6 +15,14 @@ using Statistics
 using ..Utils
 using ..Model
 
+Zygote.@nograd CUDA.driver_version
+Zygote.@nograd CUDA.task_local_state!
+Zygote.@nograd CUDA.isvalid
+Zygote.@nograd CUDA.maybe_collect
+Zygote.@nograd CUDA.randn
+Zygote.@nograd CUDA.rand
+Zygote.@nograd CUDA.CURAND.default_rng
+
 export train_stage1
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
@@ -379,6 +387,14 @@ function ChainRulesCore.rrule(::typeof(gather2d), a::CUDA.CuArray, idx::CUDA.CuA
         return (ChainRulesCore.NoTangent(), da, ChainRulesCore.ZeroTangent())
     end
 
+    return y, pullback
+end
+
+function ChainRulesCore.rrule(::Type{CUDA.CuArray}, x::AbstractArray)
+    y = CUDA.CuArray(x)
+    function pullback(ȳ)
+        return (ChainRulesCore.NoTangent(), ȳ)
+    end
     return y, pullback
 end
 

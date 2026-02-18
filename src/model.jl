@@ -23,9 +23,9 @@ function reparameterize(μ, logvar; rng=Random.default_rng(), training=true)
         μ_parent = parent(μ_parent)
     end
     ε = if μ_parent isa CUDA.AbstractGPUArray
-        CUDA.randn(eltype(μ), size(μ))
+        Zygote.dropgrad(CUDA.randn(eltype(μ), size(μ)))
     else
-        randn(rng, eltype(μ), size(μ))
+        Zygote.dropgrad(randn(rng, eltype(μ), size(μ)))
     end
     return μ .+ σ .* ε
 end
