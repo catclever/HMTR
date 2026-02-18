@@ -583,7 +583,7 @@ function train(cfg)
     Random.seed!(rng, 42)
 
     # Initialize model. Block size is passed as dummy 0. MambaCompressor doesn't strictly need it if not using stride/pooling logic dependent on it.
-    model = HMTR_Stage1_AutoEncoder(vocab_size, cfg.dim; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state)
+    model = VE_Stage1_AutoEncoder(vocab_size, cfg.dim; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state)
     ps0, st0 = Lux.setup(rng, model)
     ps = ps0
     st = st0

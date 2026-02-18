@@ -19,6 +19,32 @@ Hierarchical Mamba-Transformer-RNN Architecture implementation in Julia.
 - `src/data.jl`: 数据预处理（Parquet -> JLD2 + 分桶）/ Data preprocessing (Parquet -> JLD2 + bucketing).
 - `data/`: 数据集目录 / Dataset directory.
 
+## 数据构建参数 / Data Construction Parameters
+
+运行 `hmtr.jl data` 命令时可用的参数：
+Available parameters when running `hmtr.jl data`:
+
+| 参数 / Parameter | 类型 / Type | 默认值 / Default | 说明 / Description |
+| :--- | :--- | :--- | :--- |
+| `--data-dir` | String | `./data` | 包含 .parquet 文件的目录。<br>Directory containing .parquet files. |
+| `--parquet-file` | String | (Auto) | 指定要加载的 Parquet 文件路径。若未指定，自动使用 `data-dir` 下的第一个。<br>Specific parquet file to load. Defaults to first file in `data-dir`. |
+| `--tokenizer-name` | String | "" | HuggingFace 分词器名称（如 `bert-base-uncased`）。留空则使用字符级分词 (Char-level)。<br>HuggingFace tokenizer name. Leave empty for Character-level tokenization. |
+| `--output-file` | String | (Auto) | 输出的 `.jld2` 文件路径。默认自动生成带时间戳的文件名。<br>Output .jld2 file path. Defaults to auto-generated name with timestamp. |
+| `--max-docs` | Int | 0 | 限制处理的文档数量（用于测试）。0 表示处理所有文档。<br>Limit number of documents (for testing). 0 means process all. |
+| `--char-vocab-docs` | Int | 10000 | 字符级模式下，用于构建词表的采样文档数。<br>Number of docs to sample for building vocab in Char-level mode. |
+
+**示例 / Examples:**
+
+1. **构建完整字符级数据集 (Build full char-level dataset):**
+   ```bash
+   julia --project=. hmtr.jl data --data-dir ./data --output-file ./data/processed_full.jld2
+   ```
+
+2. **使用 BERT 分词器构建测试集 (Build test set with BERT tokenizer):**
+   ```bash
+   julia --project=. hmtr.jl data --tokenizer-name bert-base-uncased --max-docs 100
+   ```
+
 ## 快速开始 / Quick Start
 1. **环境准备 / Setup**:
    安装 Julia 并初始化依赖：

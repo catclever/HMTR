@@ -9,7 +9,7 @@ using LuxCUDA
 import ChainRulesCore
 import ChainRulesCore
 
-export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, NanoDecoder, HMTR_Stage1_AutoEncoder
+export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, LatentPredictor, NanoDecoder, HMTR_Stage1_AutoEncoder
 
 hippo_A_diag(d_state::Int, ::Type{T}=Float32) where {T<:AbstractFloat} = -(T.(collect(1:d_state)))
 
@@ -362,20 +362,42 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     return (mu, logvar), (embedding=st_emb, layers=st_layers, head=st_head)
 end
 
-# --- 2. Transformer Reasoner ---
+# --- 2. Latent Predictor (JEPA Head) ---
+
+struct LatentPredictor{L<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
+    layers::L
+    dim::Int
+end
+
+function LatentPredictor(dim::Int, hidden_dim::Int=0)
+    # Simple MLP predictor: z_t -> hidden -> z_{t+1}
+    # If hidden_dim is 0, default to 2*dim
+    h_dim = hidden_dim > 0 ? hidden_dim : 2 * dim
+    layers = Chain(
+        Dense(dim => h_dim, NNlib.gelu),
+        Dense(h_dim => h_dim, NNlib.gelu),
+        Dense(h_dim => dim)
+    )
+    return LatentPredictor(layers, dim)
+end
+
+Lux.initialparameters(rng::AbstractRNG, p::LatentPredictor) = (layers=Lux.initialparameters(rng, p.layers),)
+Lux.initialstates(rng::AbstractRNG, p::LatentPredictor) = (layers=Lux.initialstates(rng, p.layers),)
+
+function (p::LatentPredictor)(z::AbstractArray, ps, st)
+    # z: [Dim, B] or [Dim, N, B]
+    return p.layers(z, ps.layers, st.layers)
+end
+
+# --- 3. Transformer Reasoner (Optional Future) ---
+# Keeping typical Transformer structure but commenting out or leaving for reference
+# (The user wanted independent modules, LatentPredictor is the new component for Stage 1.5)
 
 struct LatentReasoner{T<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
     transformer::T
 end
 
 function LatentReasoner(dim::Int, heads::Int=8, layers::Int=4)
-    # Standard Transformer Encoder
-    # Input: [Dim, Seq_Capsules, Batch]
-
-    # We construct simplified Transformer blocks
-    # Lux doesn't have a turn-key "TransformerEncoder" with stacked blocks exported easily in all versions.
-    # We make a simple chain of blocks.
-
     blocks = [
         Chain(
             SkipConnection(
@@ -388,20 +410,13 @@ function LatentReasoner(dim::Int, heads::Int=8, layers::Int=4)
             )
         ) for _ in 1:layers
     ]
-
     return LatentReasoner(Chain(blocks...))
 end
 
-Lux.initialparameters(rng::AbstractRNG, r::LatentReasoner) = (
-    transformer=Lux.initialparameters(rng, r.transformer),
-)
-
-Lux.initialstates(rng::AbstractRNG, r::LatentReasoner) = (
-    transformer=Lux.initialstates(rng, r.transformer),
-)
+Lux.initialparameters(rng::AbstractRNG, r::LatentReasoner) = (transformer=Lux.initialparameters(rng, r.transformer),)
+Lux.initialstates(rng::AbstractRNG, r::LatentReasoner) = (transformer=Lux.initialstates(rng, r.transformer),)
 
 function (r::LatentReasoner)(x, ps, st)
-    # x: [Dim, Seq, Batch]
     return r.transformer(x, ps.transformer, st.transformer)
 end
 
@@ -596,62 +611,73 @@ end
 
 # --- 4. Stage 1 AutoEncoder Container ---
 
-struct HMTR_Stage1_AutoEncoder{E,N,D} <: Lux.AbstractLuxLayer
+struct HMTR_Stage1_AutoEncoder{E,N,P,D} <: Lux.AbstractLuxLayer
     encoder::E
     norm::N
+    predictor::P
     decoder::D
 end
 
 function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
-    # Encoder: block_size isn't strictly enforced in forward but kept in struct. 
-    # We remove block_size dependency for MambaCompressor's ctor logic if it was just for struct.
-    # But MambaCompressor defined in code has block_size. We pass 0 or a dummy if not used for striding.
     enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
     norm = FeatureLayerNorm(dim)
+    pred = LatentPredictor(dim)
     dec = NanoDecoder(vocab_size, dim, block_size; eos_id=eos_id)
-    return HMTR_Stage1_AutoEncoder(enc, norm, dec)
+    return HMTR_Stage1_AutoEncoder(enc, norm, pred, dec)
 end
 
 Lux.initialparameters(rng::AbstractRNG, m::HMTR_Stage1_AutoEncoder) = (
     encoder=Lux.initialparameters(rng, m.encoder),
     norm=Lux.initialparameters(rng, m.norm),
+    predictor=Lux.initialparameters(rng, m.predictor),
     decoder=Lux.initialparameters(rng, m.decoder)
 )
 
 Lux.initialstates(rng::AbstractRNG, m::HMTR_Stage1_AutoEncoder) = (
     encoder=Lux.initialstates(rng, m.encoder),
     norm=Lux.initialstates(rng, m.norm),
+    predictor=Lux.initialstates(rng, m.predictor),
     decoder=Lux.initialstates(rng, m.decoder)
 )
 
 function (m::HMTR_Stage1_AutoEncoder)(x, ps, st; kwargs...)
-    # x: [Dim (if embedded) or Indices, L, B]
-    # Note: MambaCompressor expects indices [L, B]? Let's check.
-    # MambaCompressor line 173: (x::AbstractMatrix{Int}, ...) -> [L_seq, Batch]
-    # BUT line 181: m.embedding(x...) suggests x is indices.
-
-    # Get target length from input x
+    # x: [L, B] (Indices)
     L, B = size(x)
 
+    # 1. Encode -> Capsules
     capsules_params, st_enc = m.encoder(x, ps.encoder, st.encoder)
     mu, logvar = capsules_params
     
-    # Reparameterize
-    # training=true by default in training loop, we can control via kwargs if needed but Lux doesn't pass it standardly here.
-    # We use Zygote.ignore or just randn.
-    # Lux.apply doesn't expose a clean "training" flag in signature usually, it's implicit or passed in st.
-    # For simplicity, we assume always training/stochastic in this call, or control variance externaly?
-    # Better: just Sample.
-    
-    # For sampling, we need randomness. Zygote ignores non-differentiable randomness, so we can use standard RNG or CUDA RNG.
+    # Reparameterize (VAE)
+    # Ideally should use randomness, here we use simple mean for inference if not specified, 
+    # but for training we need noise.
+    # We will let reparameterize handle it (it uses randn).
     z = reparameterize(mu, logvar)
     
+    # 2. Normalize Capsules
     capsules_norm, st_norm = m.norm(z, ps.norm, st.norm)
 
-    # Pass target_len = L to decoder
+    # 3. Latent Prediction (JEPA)
+    # Predict "next" latent dynamics.
+    # Note: predicting z_{t+1} from z_t. 
+    # Current call returns z_pred corresponding to input z.
+    # In loss function we will align z_pred[t] with z[t+1].
+    z_pred, st_pred = m.predictor(capsules_norm, ps.predictor, st.predictor)
+    
+    # 4. Decode -> Text
+    # Decoder reconstructs text from the *normalized* capsules
     logits, st_dec = m.decoder(capsules_norm, x, ps.decoder, st.decoder; start_id=m.encoder.eos_id)
 
-    return (logits, mu, logvar), (encoder=st_enc, norm=st_norm, decoder=st_dec)
+    # Return structure:
+    # logits: [Vocab, L, B]
+    # mu, logvar: [Dim, N_capsules, B]
+    # z: [Dim, N_capsules, B] (Sampled, normalized) - wait, capsules_norm is normalized z.
+    # z_pred: [Dim, N_capsules, B] (Predicted next state)
+    
+    out = (; logits=logits, mu=mu, logvar=logvar, z=capsules_norm, z_pred=z_pred)
+    new_st = (encoder=st_enc, norm=st_norm, predictor=st_pred, decoder=st_dec)
+    
+    return out, new_st
 end
 
 end # module Model

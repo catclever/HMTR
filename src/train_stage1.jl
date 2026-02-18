@@ -34,6 +34,7 @@ const LOSS_SPIKE_THRESHOLD = parse(Float64, get(ENV, "LOSS_SPIKE_THRESHOLD", "10
 const SKIP_ON_SPIKE = parse(Int, get(ENV, "SKIP_ON_SPIKE", "1"))
 const WARMUP_STEPS = parse(Int, get(ENV, "WARMUP_STEPS", "500"))
 const KL_WEIGHT = parse(Float64, get(ENV, "KL_WEIGHT", "0.0001"))
+const PRED_WEIGHT = parse(Float64, get(ENV, "PRED_WEIGHT", "1.0"))
 
 const PRETRAIN_EMB_FILE = get(ENV, "PRETRAIN_EMB_FILE", "")
 const INSPECT_DATA = parse(Int, get(ENV, "INSPECT_DATA", "0"))
@@ -117,6 +118,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     inspect_n = parse(Int, string(get(cli, :inspect_n, INSPECT_N)))
     warmup_steps = parse(Int, string(get(cli, :warmup_steps, WARMUP_STEPS)))
     kl_weight = parse(Float64, string(get(cli, :kl_weight, KL_WEIGHT)))
+    pred_weight = parse(Float64, string(get(cli, :pred_weight, PRED_WEIGHT)))
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
     encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
@@ -192,6 +194,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         decoder_dtype,
         warmup_steps,
         kl_weight,
+        pred_weight,
     )
 end
 
@@ -376,12 +379,27 @@ function ChainRulesCore.rrule(::typeof(gather2d), a::CUDA.CuArray, idx::CUDA.CuA
     return y, pullback
 end
 
+
 function load_data(data_file::AbstractString, meta_file::AbstractString)
     if !isfile(data_file)
         error("Data file $(data_file) not found!")
     end
     data_obj = JLD2.load(data_file)
-    data_content = data_obj["data"]
+    
+    # Determine format
+    if haskey(data_obj, "tokens") && haskey(data_obj, "reset_flags")
+        # Stream Format
+        data_content = data_obj["tokens"]
+        reset_flags = data_obj["reset_flags"]
+        is_stream = true
+        is_bucketed = false
+    else
+        # Old Bucket Format
+        data_content = data_obj["data"]
+        reset_flags = Bool[] # Empty
+        is_stream = false
+        is_bucketed = isa(data_content, AbstractDict)
+    end
 
     meta_src = if isfile(meta_file)
         JLD2.load(meta_file)
@@ -392,21 +410,21 @@ function load_data(data_file::AbstractString, meta_file::AbstractString)
     char_map = get(meta_src, "char_map", Dict{Any,Any}())
     vocab = get(meta_src, "vocab", nothing)
 
-    is_bucketed = isa(data_content, AbstractDict)
-
     vocab_size = if haskey(params, "VOCAB_SIZE")
         params["VOCAB_SIZE"]
     elseif !isempty(char_map)
-        length(char_map) + 3
+        length(char_map) + 3 # approx
     elseif vocab !== nothing
         length(vocab) - 1
     else
-        is_bucketed ? 0 : maximum(data_content)
+        is_stream ? maximum(data_content) : (is_bucketed ? 0 : maximum(data_content))
     end
     pad_id = params["PAD"]
     eos_id = params["EOS"]
+    # Try to get MASK ID
+    mask_id = get(params, "MASK", get(params, "UNK", 3))
 
-    return data_content, vocab_size, is_bucketed, pad_id, eos_id, vocab
+    return data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab
 end
 
 function decode_ids(ids::AbstractVector{Int}, vocab, pad_id::Int, eos_id::Int)
@@ -448,17 +466,14 @@ function print_training_samples(x::AbstractMatrix{Int}, vocab, pad_id::Int, eos_
     return
 end
 
-function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int, kl_weight::Float32=0f0)
-    # Forward pass now returns (logits, mu, logvar)
-    (y_pred, mu, logvar), st_new = model(x_batch, ps, st)
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0)
+    # Forward pass: (logits, mu, logvar, z, z_pred), st_new
+    out, st_new = model(x_batch, ps, st)
+    y_pred, mu, logvar, z, z_pred = out.logits, out.mu, out.logvar, out.z, out.z_pred
     
     L, B = size(x_batch)
 
-    # Note: st_new is already structured (encoder, norm, decoder) inside the calls 
-    # but model(...) returns the composite st. 
-    # model(x, ps, st) in model.jl line 609 returns (logits, mu, logvar), (encoder=..., norm=..., decoder=...)
-    # So we are good.
-
+    # 1. Reconstruction Loss (Standard)
     vocab_size = size(y_pred, 1)
     K = max(getfield(model.decoder, :block_size), 1)
     Lpad = K * cld(L, K)
@@ -490,28 +505,34 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::In
     weights = Float32.(mask)
 
     picked = gather2d(log_probs, y_batch_flat)
-    picked3 = reshape(picked, K, Lcap, B)
-    weights3 = reshape(weights, K, Lcap, B)
-
-    num = dropdims(sum((-picked3) .* weights3; dims=(1, 3)); dims=(1, 3))
-    den = dropdims(sum(weights3; dims=(1, 3)); dims=(1, 3))
-    per_chunk = num ./ max.(den, 1f0)
-    recon_loss = sum(per_chunk) / max(Float32(length(per_chunk)), 1f0)
-
-    # KL Divergence Loss
-    # kl = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
-    # dim=1 is feature dim? mu: [Dim, Lcap, B]
-    # We averge over Batch and Length, and Sum over Dim? 
-    # Or Sum over Dim, Mean over Batch/Length.
-    # Usually KL is per sample.
     
+    # Simple mean loss over valid tokens
+    num = sum((-picked) .* weights)
+    den = sum(weights)
+    recon_loss = num / max(den, 1f0)
+
+    # 2. KL Divergence Loss
     kl_per_element = -0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- exp.(logvar))
-    # Sum over dimensions, Mean over batch/capsules
     kl_loss = mean(sum(kl_per_element; dims=1))
 
-    total_loss = recon_loss + kl_weight * kl_loss
+    # 3. Latent Predictive Loss (JEPA)
+    # Task: z_pred[t] should predict z[t+1]
+    # z: [Dim, Lcap, B]
+    # Shift: z_target = z[:, 2:end, :]
+    #        z_pred_in = z_pred[:, 1:end-1, :]
+    # If Lcap=1, we can't do this loss (need sequence).
+    pred_loss = 0f0
+    if Lcap > 1
+        z_target = Zygote.dropgrad(z[:, 2:end, :]) # Stop gradient on target
+        z_p = z_pred[:, 1:end-1, :]
+        
+        diff = z_p .- z_target
+        pred_loss = mean(sum(abs2, diff; dims=1))
+    end
 
-    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss)
+    total_loss = recon_loss + kl_weight * kl_loss + pred_weight * pred_loss
+
+    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss)
 end
 
 function select_device()
@@ -573,6 +594,115 @@ end
     return val
 end
 
+function apply_reset!(st, reset_mask)
+    function _reset_leaf(leaf_state)
+        # leaf_state: Array [Hidden, ..., Batch]
+        # We assume the last dimension is Batch.
+        if leaf_state isa AbstractArray
+            nd = ndims(leaf_state)
+            if nd > 0 && size(leaf_state, nd) == length(reset_mask)
+                to_reset = findall(reset_mask)
+                if !isempty(to_reset)
+                    # In Julia: selectdim(A, d, idx)
+                    view_obj = selectdim(leaf_state, nd, to_reset)
+                    fill!(view_obj, 0)
+                end
+            end
+        end
+        return leaf_state
+    end
+    tree_map(_reset_leaf, st)
+end
+
+# --- Stream Batch Iterator ---
+# Manages B parallel streams from the 1D token array
+struct StreamBatchIterator
+    tokens::Vector{Int}
+    resets::Vector{Bool}
+    batch_size::Int
+    seq_len::Int
+    num_batches::Int
+    offsets::Vector{Int}
+    
+    function StreamBatchIterator(tokens, resets, batch_size, seq_len)
+        N = length(tokens)
+        # We divide the total data into B segments
+        segment_len = N ÷ batch_size
+        offsets = [ (b-1) * segment_len + 1 for b in 1:batch_size ]
+        # How many full batches can we make?
+        # Each batch consumes seq_len
+        # In each segment, we can fit segment_len ÷ seq_len batches
+        num_batches = segment_len ÷ seq_len
+        new(tokens, resets, batch_size, seq_len, num_batches, offsets)
+    end
+end
+
+Base.length(it::StreamBatchIterator) = it.num_batches
+
+function Base.iterate(it::StreamBatchIterator, state=1)
+    if state > it.num_batches
+        return nothing
+    end
+    
+    B = it.batch_size
+    L = it.seq_len
+    
+    # Prepare batch arrays
+    # x_batch: [L, B]
+    # reset_mask: [B] (True if a reset happened at the START of the chunk or within)
+    
+    curr_resets = falses(B)
+    batch_ids = Matrix{Int}(undef, L, B)
+    
+    for b in 1:B
+        start_idx = it.offsets[b] + (state - 1) * L
+        end_idx = start_idx + L - 1
+        
+        # Copy tokens
+        batch_ids[:, b] .= view(it.tokens, start_idx:end_idx)
+        
+        # Check for resets in this range
+        if any(view(it.resets, start_idx:end_idx))
+            curr_resets[b] = true
+        end
+    end
+    
+    # Return (x_batch, reset_mask)
+    return ((batch_ids, curr_resets), state + 1)
+end
+
+function make_batches_impl(data_content, is_stream, is_bucketed, batch_size, rng)
+    all_batches = [] # Vector{Tuple{Any, Vector{Int}}}
+    if is_stream
+         return []
+    elseif is_bucketed
+        for k in keys(data_content)
+            mat = data_content[k]
+            cols = size(mat, 2)
+            perm = shuffle(rng, 1:cols)
+
+            pos = 1
+            while pos <= cols
+                end_pos = min(pos + batch_size - 1, cols)
+                batch_ids = perm[pos:end_pos]
+                push!(all_batches, (k, batch_ids))
+                pos = end_pos + 1
+            end
+        end
+    else
+        cols = size(data_content, 2)
+        perm = shuffle(rng, 1:cols)
+        pos = 1
+        while pos <= cols
+            end_pos = min(pos + batch_size - 1, cols)
+            batch_ids = perm[pos:end_pos]
+            push!(all_batches, ("default", batch_ids))
+            pos = end_pos + 1
+        end
+    end
+    return shuffle(rng, all_batches)
+end
+
 function train(cfg)
     mkpath(cfg.checkpoint_dir)
 
@@ -581,16 +711,17 @@ function train(cfg)
     println("Using device: $dev")
     flush(stdout)
 
-    data_content, vocab_size, is_bucketed, pad_id, eos_id, vocab = load_data(cfg.data_file, cfg.meta_file)
+    data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab = load_data(cfg.data_file, cfg.meta_file)
 
     N_total = 0
-    buckets = String[]
-    if is_bucketed
+    if is_stream
+        N_total = length(data_content)
+        println("Loaded STREAM data. Total tokens: $N_total, Vocab: $vocab_size")
+    elseif is_bucketed
         for (k, v) in data_content
             N_total += size(v, 2)
-            push!(buckets, k)
         end
-        println("Loaded bucketed data. Total samples: $N_total, Vocab: $vocab_size. Buckets: $buckets")
+        println("Loaded bucketed data. Total samples: $N_total, Vocab: $vocab_size.")
     else
         N_total = size(data_content, 2)
         println("Loaded simple data. Total samples: $N_total, Vocab: $vocab_size")
@@ -600,7 +731,7 @@ function train(cfg)
     rng = Random.default_rng()
     Random.seed!(rng, 42)
 
-    # Initialize model. Block size is passed as dummy 0. MambaCompressor doesn't strictly need it if not using stride/pooling logic dependent on it.
+    # Initialize model
     model = HMTR_Stage1_AutoEncoder(vocab_size, cfg.dim; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state)
     ps0, st0 = Lux.setup(rng, model)
     ps = ps0
@@ -648,47 +779,33 @@ function train(cfg)
 
     start_id = eos_id
 
-    # Batch Generator
-    function make_batches()
-        all_batches = [] # Vector{Tuple{Any, Vector{Int}}}
-        if is_bucketed
-            for k in keys(data_content)
-                mat = data_content[k]
-                cols = size(mat, 2)
-                perm = shuffle(rng, 1:cols)
+    # Initialize Iterator
+    SEQ_LEN = parse(Int, get(ENV, "SEQ_LEN", "1024"))
+    
+    local batches
+    local num_batches_per_epoch
+    local stream_iter
 
-                pos = 1
-                while pos <= cols
-                    end_pos = min(pos + cfg.batch_size - 1, cols)
-                    batch_ids = perm[pos:end_pos]
-                    push!(all_batches, (k, batch_ids))
-                    pos = end_pos + 1
-                end
-            end
+    if is_stream
+        stream_iter = StreamBatchIterator(data_content, reset_flags, cfg.batch_size, SEQ_LEN)
+        if cfg.max_batches > 0
+            batches = Iterators.take(stream_iter, cfg.max_batches)
+            num_batches_per_epoch = min(length(stream_iter), cfg.max_batches)
         else
-            cols = size(data_content, 2)
-            perm = shuffle(rng, 1:cols)
-            pos = 1
-            while pos <= cols
-                end_pos = min(pos + cfg.batch_size - 1, cols)
-                batch_ids = perm[pos:end_pos]
-                push!(all_batches, ("default", batch_ids))
-                pos = end_pos + 1
-            end
+            batches = stream_iter
+            num_batches_per_epoch = length(stream_iter)
         end
-        return shuffle(rng, all_batches)
-    end
-
-    batches = make_batches()
-    num_batches = length(batches)
-    if cfg.max_batches > 0
-        num_batches = min(num_batches, cfg.max_batches)
-        batches = batches[1:num_batches]
+    else
+        batches = make_batches_impl(data_content, is_stream, is_bucketed, cfg.batch_size, rng)
+        if cfg.max_batches > 0
+            batches = batches[1:min(length(batches), cfg.max_batches)]
+        end
+        num_batches_per_epoch = length(batches)
     end
 
     # Scheduler Setup
     warmup_steps = cfg.warmup_steps
-    total_steps = cfg.epochs * num_batches
+    total_steps = cfg.epochs * num_batches_per_epoch
     println("Training Plan: $total_steps total steps, $warmup_steps warmup steps.")
     flush(stdout)
 
@@ -707,36 +824,48 @@ function train(cfg)
         total_loss = 0.0
         n_updates = 0
 
-        batches = make_batches()
-        if cfg.max_batches > 0
-            batches = batches[1:min(length(batches), cfg.max_batches)]
+        if !is_stream
+            batches = make_batches_impl(data_content, is_stream, is_bucketed, cfg.batch_size, rng)
+            if cfg.max_batches > 0
+                batches = batches[1:min(length(batches), cfg.max_batches)]
+            end
         end
 
-        @time for (i, (b_key, b_ids)) in enumerate(batches)
+        for (i, batch_data) in enumerate(batches)
+            local x_cpu_raw, reset_mask
+            
+            if is_stream
+                x_cpu_raw, reset_mask = batch_data
+            else
+                b_key, b_ids = batch_data
+                 tokens_cpu = if is_bucketed
+                    data_content[b_key][:, b_ids]
+                else
+                    data_content[:, b_ids]
+                end
+                
+                if size(tokens_cpu, 2) == 0
+                    continue
+                end
+                
+                x_cpu_raw = Matrix{Int}(tokens_cpu)
+                reset_mask = falses(size(x_cpu_raw, 2)) # No resets for bucketed
+            end
 
             # Update LR
             target_lr = get_target_lr(cfg.lr)
             current_lr = get_lr(train_step + 1, warmup_steps, target_lr, total_steps)
             Optimisers.adjust!(opt_state, current_lr)
 
-            tokens_cpu = if is_bucketed
-                data_content[b_key][:, b_ids]
-            else
-                data_content[:, b_ids]
-            end
-
-            if size(tokens_cpu, 2) == 0
-                continue
-            end
-
-            x_cpu = Matrix{Int}(tokens_cpu)
-            x_batch = x_cpu |> dev
-            # Autoencoder target is same as input
-            y_batch = x_batch
+            # --- State Reset Logic ---
+            apply_reset!(st, reset_mask)
+            
+            x_batch = x_cpu_raw |> dev
+            y_batch = x_batch # AutoEncoder target
 
             # Gradient
             (loss, st_new, internals), back = Zygote.pullback(
-                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id, kl_weight=Float32(cfg.kl_weight)), ps
+                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id, kl_weight=Float32(cfg.kl_weight), pred_weight=Float32(cfg.pred_weight)), ps
             )
 
             loss_val = Float32(loss)
@@ -767,7 +896,7 @@ function train(cfg)
             train_step += 1
 
             if i % 50 == 0
-                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f) | LR: %.2e\n" epoch i num_batches loss_val internals.recon internals.kl current_lr
+                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f | Pred: %.4f) | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.recon internals.kl internals.pred current_lr
             end
 
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
@@ -802,8 +931,9 @@ function train(cfg)
     end
 end
 
+
 function inspect_data(cfg)
-    data_content, vocab_size, is_bucketed, pad_id, eos_id, vocab = load_data(cfg.data_file, cfg.meta_file)
+    data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab = load_data(cfg.data_file, cfg.meta_file)
 
     N_total = 0
     if is_bucketed

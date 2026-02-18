@@ -345,7 +345,7 @@ function infer(cfg)
         ds === nothing ? 16 : Int(ds)
     end
 
-    model = HMTR_Stage1_AutoEncoder(vocab_size, dim; block_size=meta.block_size, pad_id=meta.pad_id, eos_id=meta.eos_id, mamba_d_state=mamba_d_state)
+    model = VE_Stage1_AutoEncoder(vocab_size, dim; block_size=meta.block_size, pad_id=meta.pad_id, eos_id=meta.eos_id, mamba_d_state=mamba_d_state)
 
     dev = select_device(cfg.force_cpu)
     cpu = cpu_device()

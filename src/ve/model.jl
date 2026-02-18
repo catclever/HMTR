@@ -9,7 +9,7 @@ using LuxCUDA
 import ChainRulesCore
 import ChainRulesCore
 
-export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, NanoDecoder, HMTR_Stage1_AutoEncoder
+export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, NanoDecoder, VE_Stage1_AutoEncoder
 
 hippo_A_diag(d_state::Int, ::Type{T}=Float32) where {T<:AbstractFloat} = -(T.(collect(1:d_state)))
 
@@ -563,35 +563,35 @@ end
 
 # --- 4. Stage 1 AutoEncoder Container ---
 
-struct HMTR_Stage1_AutoEncoder{E,N,D} <: Lux.AbstractLuxLayer
+struct VE_Stage1_AutoEncoder{E,N,D} <: Lux.AbstractLuxLayer
     encoder::E
     norm::N
     decoder::D
 end
 
-function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
+function VE_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
     # Encoder: block_size isn't strictly enforced in forward but kept in struct. 
     # We remove block_size dependency for MambaCompressor's ctor logic if it was just for struct.
     # But MambaCompressor defined in code has block_size. We pass 0 or a dummy if not used for striding.
     enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
     norm = FeatureLayerNorm(dim)
     dec = NanoDecoder(vocab_size, dim, block_size; eos_id=eos_id)
-    return HMTR_Stage1_AutoEncoder(enc, norm, dec)
+    return VE_Stage1_AutoEncoder(enc, norm, dec)
 end
 
-Lux.initialparameters(rng::AbstractRNG, m::HMTR_Stage1_AutoEncoder) = (
+Lux.initialparameters(rng::AbstractRNG, m::VE_Stage1_AutoEncoder) = (
     encoder=Lux.initialparameters(rng, m.encoder),
     norm=Lux.initialparameters(rng, m.norm),
     decoder=Lux.initialparameters(rng, m.decoder)
 )
 
-Lux.initialstates(rng::AbstractRNG, m::HMTR_Stage1_AutoEncoder) = (
+Lux.initialstates(rng::AbstractRNG, m::VE_Stage1_AutoEncoder) = (
     encoder=Lux.initialstates(rng, m.encoder),
     norm=Lux.initialstates(rng, m.norm),
     decoder=Lux.initialstates(rng, m.decoder)
 )
 
-function (m::HMTR_Stage1_AutoEncoder)(x, ps, st; kwargs...)
+function (m::VE_Stage1_AutoEncoder)(x, ps, st; kwargs...)
     # x: [Dim (if embedded) or Indices, L, B]
     # Note: MambaCompressor expects indices [L, B]? Let's check.
     # MambaCompressor line 173: (x::AbstractMatrix{Int}, ...) -> [L_seq, Batch]
