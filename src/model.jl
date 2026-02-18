@@ -18,7 +18,15 @@ function reparameterize(μ, logvar; rng=Random.default_rng(), training=true)
         return μ
     end
     σ = exp.(0.5f0 .* logvar)
-    ε = randn(rng, eltype(μ), size(μ))
+    μ_parent = μ
+    while μ_parent isa SubArray || μ_parent isa Base.ReshapedArray
+        μ_parent = parent(μ_parent)
+    end
+    ε = if μ_parent isa CUDA.AbstractGPUArray
+        CUDA.randn(eltype(μ), size(μ))
+    else
+        randn(rng, eltype(μ), size(μ))
+    end
     return μ .+ σ .* ε
 end
 
@@ -345,6 +353,13 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     s = size(pooled)
     # s is (Dim, Lcap, B)
     pooled_flat = reshape(pooled, s[1], s[2] * s[3])
+    pooled_parent = parent(pooled_flat)
+    if pooled_parent isa SubArray
+        pooled_parent = parent(pooled_parent)
+    end
+    if pooled_parent isa CUDA.AbstractGPUArray
+        pooled_flat = CUDA.CuArray(pooled_flat)
+    end
     
     # Project to VAE params
     # pooled_flat: [Dim, Lcap * B]
@@ -543,7 +558,7 @@ function sinusoidal_position_encoding(like, D::Int, L::Int)
 
     positions = positions_cpu
     div_idx = div_idx_cpu
-    if like isa Union{CUDA.CuArray, CUDA.CuDeviceArray}
+    if like isa CUDA.AbstractGPUArray
         positions = CUDA.CuArray(positions_cpu)
         div_idx = CUDA.CuArray(div_idx_cpu)
     end

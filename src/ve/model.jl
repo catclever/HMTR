@@ -325,6 +325,13 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
 
     hidden4 = reshape(hidden_pad, size(hidden_pad, 1), stride, Lcap, B)
     capsules = @view hidden4[:, stride, :, :]
+    capsules_parent = parent(capsules)
+    if capsules_parent isa SubArray
+        capsules_parent = parent(capsules_parent)
+    end
+    if capsules_parent isa CUDA.AbstractGPUArray
+        capsules = CUDA.CuArray(capsules)
+    end
 
     return capsules, (embedding=st_emb, layers=st_layers)
 end
@@ -494,7 +501,7 @@ function sinusoidal_position_encoding(like, D::Int, L::Int)
 
     positions = positions_cpu
     div_idx = div_idx_cpu
-    if like isa Union{CUDA.CuArray, CUDA.CuDeviceArray}
+    if like isa CUDA.AbstractGPUArray
         positions = CUDA.CuArray(positions_cpu)
         div_idx = CUDA.CuArray(div_idx_cpu)
     end
