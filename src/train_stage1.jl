@@ -904,7 +904,6 @@ function train(cfg)
             loss_val = Float32(loss)
             
             # Check for loss spike / NaN
-            spike = !(isfinite(loss_val)) || (loss_val > Float32(cfg.loss_spike_threshold))
             if spike
                 stats = batch_stats(x_batch, vocab_size, pad_id, eos_id)
                 pad_frac = stats.n_pad / max(stats.n_total, 1)
@@ -913,6 +912,13 @@ function train(cfg)
                 if stats.x_min < 1 || stats.x_max > vocab_size
                     @printf "SPIKE TokenId out of range: expected [1,%d]\n" vocab_size
                 end
+                
+                # If NaN, we MUST reset the state, otherwise future steps will also be NaN
+                if !isfinite(loss_val)
+                    println("WARNING: Loss is NaN/Inf. Resetting model state to clear corrupted hidden states.")
+                    st = st0 |> dev
+                end
+
                 if cfg.skip_on_spike
                     continue
                 end

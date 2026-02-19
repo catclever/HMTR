@@ -118,7 +118,8 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
     dt_scale = 0.1f0
     for t in 1:L
         xt = view(x, :, t, :)
-        dt = NNlib.softplus.(view(dt_raw, :, t, :)) .* dt_scale .+ dt_min
+        dt_val = NNlib.softplus.(view(dt_raw, :, t, :)) .* dt_scale .+ dt_min
+        dt = clamp.(dt_val, dt_min, 5f0)
         Bt = view(B_raw, :, t, :)
         Ct = view(C_raw, :, t, :)
 
@@ -153,7 +154,10 @@ function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
     dt_scale = 0.1f0
     for t in 1:L
         xt = @view x[:, t, :]
-        dt = NNlib.softplus.(@view dt_raw[:, t, :]) .* dt_scale .+ dt_min
+        # Softplus is safe, but dt_scale * softplus can be large.
+        # Clamp dt to avoid exp(A * dt) exploding or vanishing too hard.
+        dt_val = NNlib.softplus.(@view dt_raw[:, t, :]) .* dt_scale .+ dt_min
+        dt = clamp.(dt_val, dt_min, 5f0)
         Bt = @view B_raw[:, t, :]
         Ct = @view C_raw[:, t, :]
 
@@ -219,7 +223,11 @@ function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, 
             dt_raw_t = dt_raw[:, t, :]
             Bt = B_raw[:, t, :]
             Ct = C_raw[:, t, :]
-            dt = NNlib.softplus.(dt_raw_t) .* dt_scale .+ dt_min
+            dt_val = NNlib.softplus.(dt_raw_t) .* dt_scale .+ dt_min
+            dt = clamp.(dt_val, dt_min, 5f0)
+            
+            # Mask for dt gradient: 1 if not clamped, 0 if clamped
+            dt_mask = (dt_val .>= dt_min) .& (dt_val .<= 5f0)
 
             dt3 = reshape(dt, d_model, 1, batch)
             xt3 = reshape(xt, d_model, 1, batch)
@@ -250,7 +258,8 @@ function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, 
             gdt .+= dropdims(sum(gdecay .* (A2 .* decay); dims=2); dims=2)
             dA .+= dropdims(sum(gdecay .* (reshape(dt, d_model, 1, batch) .* decay); dims=3); dims=3)
 
-            ddt_raw[:, t, :] .+= gdt .* (dt_scale .* NNlib.sigmoid.(dt_raw_t))
+            gdt_raw = gdt .* (dt_scale .* NNlib.sigmoid.(dt_raw_t))
+            ddt_raw[:, t, :] .+= gdt_raw .* dt_mask
 
             gh .= gh .* decay
         end
