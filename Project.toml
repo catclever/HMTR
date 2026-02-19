@@ -18,3 +18,6 @@ Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 StaticLint = "b3cc710f-9c33-5bdb-a03d-a94903873e97"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[extras]
+CUDA_Runtime_jll = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"

@@ -272,6 +272,10 @@ function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu; show_id
     x_dev = x |> dev
 
     capsules, _st_enc = model.encoder(x_dev, ps.encoder, st.encoder)
+    if capsules isa Tuple
+        mu, _logvar = capsules
+        capsules = mu
+    end
     capsules_norm, _st_norm = model.norm(capsules, ps.norm, st.norm)
     pred = greedy_decode_capsules(model.decoder, capsules_norm, ps.decoder, st.decoder, meta, dev, cpu)
 
