@@ -21,6 +21,7 @@ const TEXT = get(ENV, "TEXT", "")
 const SHOW_IDS = parse(Int, get(ENV, "SHOW_IDS", "0"))
 const FORCE_CPU = parse(Int, get(ENV, "FORCE_CPU", "0"))
 const INTERACTIVE = parse(Int, get(ENV, "INTERACTIVE", "0"))
+const SAMPLE = parse(Int, get(ENV, "SAMPLE", "0"))
 
 function resolve_config(cli::Dict{Symbol, Any})
     data_file = get(cli, :data_file, DATA_FILE)
@@ -61,15 +62,17 @@ function resolve_config(cli::Dict{Symbol, Any})
     show_ids_raw = string(get(cli, :show_ids, SHOW_IDS))
     force_cpu_raw = string(get(cli, :force_cpu, FORCE_CPU))
     interactive_raw = string(get(cli, :interactive, INTERACTIVE))
+    sample_raw = string(get(cli, :sample, SAMPLE))
     show_ids = show_ids_raw == "true" || show_ids_raw == "1"
     force_cpu = force_cpu_raw == "true" || force_cpu_raw == "1"
     interactive = interactive_raw == "true" || interactive_raw == "1"
+    sample = sample_raw == "true" || sample_raw == "1"
 
     if isempty(text) && !interactive
         error("--text is required unless --interactive is enabled")
     end
 
-    return (; data_file, meta_file, checkpoint_file, text, show_ids, force_cpu, interactive)
+    return (; data_file, meta_file, checkpoint_file, text, show_ids, force_cpu, interactive, sample)
 end
 
 function select_device(force_cpu::Bool)
@@ -267,14 +270,14 @@ function greedy_decode_capsules(decoder, capsules, ps_dec, st_dec, meta, dev, cp
     return logits_to_ids(final_logits |> cpu)
 end
 
-function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu; show_ids::Bool)
+function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; show_ids::Bool, sample::Bool)
     x = encode_text_to_seq(text, meta)
     x_dev = x |> dev
 
     capsules, _st_enc = model.encoder(x_dev, ps.encoder, st.encoder)
     if capsules isa Tuple
-        mu, _logvar = capsules
-        capsules = mu
+        mu, logvar = capsules
+        capsules = sample ? Model.reparameterize(mu, logvar; rng=rng, training=true) : mu
     end
     capsules_norm, _st_norm = model.norm(capsules, ps.norm, st.norm)
     pred = greedy_decode_capsules(model.decoder, capsules_norm, ps.decoder, st.decoder, meta, dev, cpu)
@@ -369,6 +372,8 @@ function infer(cfg)
     ps = ps |> dev
     st = st |> dev
 
+    rng = Random.default_rng()
+
     if cfg.interactive
         while true
             print("> ")
@@ -377,12 +382,12 @@ function infer(cfg)
             if isempty(s) || s == ":q" || s == "quit" || s == "exit"
                 break
             end
-            infer_once(s, model, ps, st, meta, dev, cpu; show_ids=cfg.show_ids)
+            infer_once(s, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
         end
         return
     end
 
-    infer_once(cfg.text, model, ps, st, meta, dev, cpu; show_ids=cfg.show_ids)
+    infer_once(cfg.text, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
     return
 end
 
@@ -396,6 +401,7 @@ function infer_stage1(args::Vector{String})
         println("  --data-file <path>        Path to data file (for vocab/meta)")
         println("  --show-ids                Show token IDs")
         println("  --force-cpu               Force CPU usage")
+        println("  --sample                  Enable VAE resampling")
         return
     end
     cli = Utils.parse_cli_args(args)

@@ -3,18 +3,20 @@ julia --project=. hmtr.jl train_stage1 \
   --meta-file /home/HMTR/data/processed_stream_char_20260218_111813_meta.jld2 \
   --checkpoint-dir /home/HMTR/checkpoints \
   --checkpoint-prefix ckpt_stage1_stream_seq512 \
-  --epochs 5 \
+  --epochs 2 \
   --batch-size 8 \
   --lr 1e-3 \
   --dim 256 \
   --mamba-d-state 32 \
   --warmup-steps 500 \
   --max-batches 0 \
-  --save-every 0 \
+  --save-every 10000 \
   --grad-clip-norm 5.0 \
-  --loss-spike-threshold 10.0 \
+  --loss-spike-threshold 10.5 \
   --skip-on-spike 1 \
   --kl-weight 1e-4 \
   --pred-weight 1.0 \
   --dtype fp32 \
   --seq-len 512
+
+

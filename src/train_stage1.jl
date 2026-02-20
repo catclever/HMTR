@@ -904,6 +904,7 @@ function train(cfg)
             loss_val = Float32(loss)
             
             # Check for loss spike / NaN
+            spike = !isfinite(loss_val) || loss_val > Float32(cfg.loss_spike_threshold)
             if spike
                 stats = batch_stats(x_batch, vocab_size, pad_id, eos_id)
                 pad_frac = stats.n_pad / max(stats.n_total, 1)
