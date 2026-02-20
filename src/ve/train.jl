@@ -32,6 +32,7 @@ const GRAD_CLIP_NORM = parse(Float64, get(ENV, "GRAD_CLIP_NORM", "5.0"))
 const LOSS_SPIKE_THRESHOLD = parse(Float64, get(ENV, "LOSS_SPIKE_THRESHOLD", "10.0"))
 const SKIP_ON_SPIKE = parse(Int, get(ENV, "SKIP_ON_SPIKE", "1"))
 const WARMUP_STEPS = parse(Int, get(ENV, "WARMUP_STEPS", "500"))
+const TEACHER_FORCING = parse(Int, get(ENV, "TEACHER_FORCING", "0"))
 
 const PRETRAIN_EMB_FILE = get(ENV, "PRETRAIN_EMB_FILE", "")
 const INSPECT_DATA = parse(Int, get(ENV, "INSPECT_DATA", "0"))
@@ -114,6 +115,7 @@ function resolve_config(cli::Dict{Symbol,Any})
 
     inspect_n = parse(Int, string(get(cli, :inspect_n, INSPECT_N)))
     warmup_steps = parse(Int, string(get(cli, :warmup_steps, WARMUP_STEPS)))
+    teacher_forcing = parse_bool(:teacher_forcing, TEACHER_FORCING)
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
     encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
@@ -188,6 +190,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         norm_dtype,
         decoder_dtype,
         warmup_steps,
+        teacher_forcing,
     )
 end
 
@@ -444,13 +447,13 @@ function print_training_samples(x::AbstractMatrix{Int}, vocab, pad_id::Int, eos_
     return
 end
 
-function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int)
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int, teacher_forcing::Bool=false)
     capsules, st_enc = model.encoder(x_batch, ps.encoder, st.encoder)
     capsules_norm, st_norm = model.norm(capsules, ps.norm, st.norm)
 
     # Decoder needs target length. For AutoEncoder, target len = input len.
     L, B = size(x_batch)
-    y_pred, st_dec = model.decoder(capsules_norm, y_batch, ps.decoder, st.decoder; start_id=start_id)
+    y_pred, st_dec = model.decoder(capsules_norm, y_batch, ps.decoder, st.decoder; start_id=start_id, teacher_forcing=teacher_forcing)
 
     st_new = (encoder=st_enc, norm=st_norm, decoder=st_dec)
 
@@ -718,7 +721,7 @@ function train(cfg)
 
             # Gradient
             (loss, st_new, _), back = Zygote.pullback(
-                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id), ps
+                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id, teacher_forcing=cfg.teacher_forcing), ps
             )
 
             loss_val = Float32(loss)
@@ -832,6 +835,7 @@ function train_stage1(args::Vector{String})
         println("  --dim <int>               Model dimension")
         println("  --mamba-d-state <int>     Mamba d_state (default: $MAMBA_D_STATE)")
         println("  --warmup-steps <int>      Warmup steps (default: $WARMUP_STEPS)")
+        println("  --teacher-forcing         Enable teacher forcing")
         println("  --inspect-data            Inspect data instead of training")
         return
     end

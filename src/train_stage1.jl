@@ -43,6 +43,7 @@ const SKIP_ON_SPIKE = parse(Int, get(ENV, "SKIP_ON_SPIKE", "1"))
 const WARMUP_STEPS = parse(Int, get(ENV, "WARMUP_STEPS", "500"))
 const KL_WEIGHT = parse(Float64, get(ENV, "KL_WEIGHT", "0.0001"))
 const PRED_WEIGHT = parse(Float64, get(ENV, "PRED_WEIGHT", "1.0"))
+const TEACHER_FORCING = parse(Int, get(ENV, "TEACHER_FORCING", "0"))
 
 const PRETRAIN_EMB_FILE = get(ENV, "PRETRAIN_EMB_FILE", "")
 const INSPECT_DATA = parse(Int, get(ENV, "INSPECT_DATA", "0"))
@@ -128,6 +129,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     warmup_steps = parse(Int, string(get(cli, :warmup_steps, WARMUP_STEPS)))
     kl_weight = parse(Float64, string(get(cli, :kl_weight, KL_WEIGHT)))
     pred_weight = parse(Float64, string(get(cli, :pred_weight, PRED_WEIGHT)))
+    teacher_forcing = parse_bool(:teacher_forcing, TEACHER_FORCING)
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
     encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
@@ -205,6 +207,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         warmup_steps,
         kl_weight,
         pred_weight,
+        teacher_forcing,
         seq_len,
     )
 end
@@ -485,9 +488,9 @@ function print_training_samples(x::AbstractMatrix{Int}, vocab, pad_id::Int, eos_
     return
 end
 
-function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0)
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0, teacher_forcing::Bool=false)
     # Forward pass: (logits, mu, logvar, z, z_pred), st_new
-    out, st_new = model(x_batch, ps, st)
+    out, st_new = model(x_batch, ps, st; teacher_forcing=teacher_forcing)
     y_pred, mu, logvar, z, z_pred = out.logits, out.mu, out.logvar, out.z, out.z_pred
     
     L, B = size(x_batch)
@@ -898,7 +901,7 @@ function train(cfg)
 
             # Gradient
             (loss, st_new, internals), back = Zygote.pullback(
-                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id, kl_weight=Float32(cfg.kl_weight), pred_weight=Float32(cfg.pred_weight)), ps
+                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id, kl_weight=Float32(cfg.kl_weight), pred_weight=Float32(cfg.pred_weight), teacher_forcing=cfg.teacher_forcing), ps
             )
 
             loss_val = Float32(loss)
@@ -1024,6 +1027,7 @@ function train_stage1(args::Vector{String})
         println("  --mamba-d-state <int>     Mamba d_state (default: $MAMBA_D_STATE)")
         println("  --warmup-steps <int>      Warmup steps (default: $WARMUP_STEPS)")
         println("  --seq-len <int>           Stream chunk length (default: $SEQ_LEN)")
+        println("  --teacher-forcing         Enable teacher forcing")
         println("  --inspect-data            Inspect data instead of training")
         return
     end

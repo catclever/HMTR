@@ -410,7 +410,7 @@ Lux.initialstates(rng::AbstractRNG, d::NanoDecoder) = (
     proj=Lux.initialstates(rng, d.proj),
 )
 
-function (d::NanoDecoder)(capsules, tokens::AbstractMatrix{Int}, ps, st; start_id::Int=d.eos_id)
+function (d::NanoDecoder)(capsules, tokens::AbstractMatrix{Int}, ps, st; start_id::Int=d.eos_id, teacher_forcing::Bool=false)
     D, _, B = size(capsules)
     K = max(d.block_size, 1)
 
@@ -441,13 +441,21 @@ function (d::NanoDecoder)(capsules, tokens::AbstractMatrix{Int}, ps, st; start_i
     st_proj = st.proj
 
     logits_steps = ()
+    prev_ids = start_ids
     for k in 1:K
-        prev_ids = k == 1 ? start_ids : copy(reshape(@view(t3[k - 1, :, :]), N))
+        if teacher_forcing
+            prev_ids = k == 1 ? start_ids : copy(reshape(@view(t3[k - 1, :, :]), N))
+        end
         x_in, st_emb = d.embedding(prev_ids, ps.embedding, st_emb)
         (out, (h_new,)), st_cell = d.cell((x_in, (h,)), ps.cell, st_cell)
         h = h_new
         logits, st_proj = d.proj(out, ps.proj, st_proj)
         logits_steps = (logits_steps..., reshape(logits, vocab_size, 1, N))
+        if !teacher_forcing && k < K
+            logits_cpu = logits isa CUDA.AbstractGPUArray ? Array(logits) : logits
+            prev_ids_cpu = [Int(findmax(@view logits_cpu[:, i])[2]) for i in 1:size(logits_cpu, 2)]
+            prev_ids = logits isa CUDA.AbstractGPUArray ? CUDA.CuArray(prev_ids_cpu) : prev_ids_cpu
+        end
     end
 
     out_buf = cat(logits_steps...; dims=2)
@@ -598,7 +606,7 @@ Lux.initialstates(rng::AbstractRNG, m::VE_Stage1_AutoEncoder) = (
     decoder=Lux.initialstates(rng, m.decoder)
 )
 
-function (m::VE_Stage1_AutoEncoder)(x, ps, st; kwargs...)
+function (m::VE_Stage1_AutoEncoder)(x, ps, st; teacher_forcing::Bool=false)
     # x: [Dim (if embedded) or Indices, L, B]
     # Note: MambaCompressor expects indices [L, B]? Let's check.
     # MambaCompressor line 173: (x::AbstractMatrix{Int}, ...) -> [L_seq, Batch]
@@ -611,7 +619,7 @@ function (m::VE_Stage1_AutoEncoder)(x, ps, st; kwargs...)
     capsules_norm, st_norm = m.norm(capsules, ps.norm, st.norm)
 
     # Pass target_len = L to decoder
-    logits, st_dec = m.decoder(capsules_norm, x, ps.decoder, st.decoder; start_id=m.encoder.eos_id)
+    logits, st_dec = m.decoder(capsules_norm, x, ps.decoder, st.decoder; start_id=m.encoder.eos_id, teacher_forcing=teacher_forcing)
 
     return logits, (encoder=st_enc, norm=st_norm, decoder=st_dec)
 end
