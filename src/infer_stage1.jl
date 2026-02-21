@@ -230,6 +230,18 @@ function logits_to_ids(logits)
     return ids
 end
 
+function stop_after_eos(ids::AbstractMatrix{Int}, eos_id::Int)
+    L, B = size(ids)
+    out = copy(ids)
+    for b in 1:B
+        pos = findfirst(==(eos_id), @view out[:, b])
+        if pos !== nothing && pos < L
+            out[pos + 1:end, b] .= eos_id
+        end
+    end
+    return out
+end
+
 function greedy_decode_capsules(decoder, capsules, ps_dec, st_dec, meta, dev, cpu)
     D, L_cap, B = size(capsules)
     K = hasproperty(decoder, :block_size) ? getfield(decoder, :block_size) : meta.block_size
@@ -281,6 +293,7 @@ function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; sh
     end
     capsules_norm, _st_norm = model.norm(capsules, ps.norm, st.norm)
     pred = greedy_decode_capsules(model.decoder, capsules_norm, ps.decoder, st.decoder, meta, dev, cpu)
+    pred = stop_after_eos(pred, meta.eos_id)
 
     input_text = decode_ids(vec(x), meta)
     pred_text = decode_ids(vec(pred), meta)

@@ -355,8 +355,12 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     end
 
     hidden4 = reshape(hidden_pad, size(hidden_pad, 1), stride, Lcap, B)
-    # Pool: Take the last token of each block as the summary
-    pooled = @view hidden4[:, stride, :, :]
+    pooled = similar(hidden_pad, size(hidden_pad, 1), Lcap, B)
+    rem = seq_len - (Lcap - 1) * stride
+    for c in 1:Lcap
+        idx = c == Lcap ? rem : stride
+        @views pooled[:, c, :] .= hidden4[:, idx, c, :]
+    end
     
     # helper for view preservation and batching
     s = size(pooled)
