@@ -22,6 +22,7 @@ const SHOW_IDS = parse(Int, get(ENV, "SHOW_IDS", "0"))
 const FORCE_CPU = parse(Int, get(ENV, "FORCE_CPU", "0"))
 const INTERACTIVE = parse(Int, get(ENV, "INTERACTIVE", "0"))
 const SAMPLE = parse(Int, get(ENV, "SAMPLE", "0"))
+const PREDICT = parse(Int, get(ENV, "PREDICT", "0"))
 
 function resolve_config(cli::Dict{Symbol, Any})
     data_file = get(cli, :data_file, DATA_FILE)
@@ -63,16 +64,18 @@ function resolve_config(cli::Dict{Symbol, Any})
     force_cpu_raw = string(get(cli, :force_cpu, FORCE_CPU))
     interactive_raw = string(get(cli, :interactive, INTERACTIVE))
     sample_raw = string(get(cli, :sample, SAMPLE))
+    predict_raw = string(get(cli, :predict, PREDICT))
     show_ids = show_ids_raw == "true" || show_ids_raw == "1"
     force_cpu = force_cpu_raw == "true" || force_cpu_raw == "1"
     interactive = interactive_raw == "true" || interactive_raw == "1"
     sample = sample_raw == "true" || sample_raw == "1"
+    predict = predict_raw == "true" || predict_raw == "1"
 
     if isempty(text) && !interactive
         error("--text is required unless --interactive is enabled")
     end
 
-    return (; data_file, meta_file, checkpoint_file, text, show_ids, force_cpu, interactive, sample)
+    return (; data_file, meta_file, checkpoint_file, text, show_ids, force_cpu, interactive, sample, predict)
 end
 
 function select_device(force_cpu::Bool)
@@ -282,7 +285,7 @@ function greedy_decode_capsules(decoder, capsules, ps_dec, st_dec, meta, dev, cp
     return logits_to_ids(final_logits |> cpu)
 end
 
-function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; show_ids::Bool, sample::Bool)
+function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; show_ids::Bool, sample::Bool, predict::Bool)
     x = encode_text_to_seq(text, meta)
     x_dev = x |> dev
 
@@ -301,6 +304,18 @@ function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; sh
     println("Input:  ", text)
     println("Tokens: ", input_text)
     println("Recons: ", pred_text)
+    if predict
+        z_pred, _st_pred = model.predictor(capsules_norm, ps.predictor, st.predictor)
+        if size(z_pred, 2) > 1
+            z_next = @view z_pred[:, 1:end-1, :]
+            pred_next = greedy_decode_capsules(model.decoder, z_next, ps.decoder, st.decoder, meta, dev, cpu)
+            pred_next = stop_after_eos(pred_next, meta.eos_id)
+            pred_next_text = decode_ids(vec(pred_next), meta)
+            println("PredNext: ", pred_next_text)
+        else
+            println("PredNext: ")
+        end
+    end
 
     if show_ids
         println("InputIds:")
@@ -395,12 +410,12 @@ function infer(cfg)
             if isempty(s) || s == ":q" || s == "quit" || s == "exit"
                 break
             end
-            infer_once(s, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
+            infer_once(s, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, predict=cfg.predict)
         end
         return
     end
 
-    infer_once(cfg.text, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
+    infer_once(cfg.text, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, predict=cfg.predict)
     return
 end
 
@@ -415,6 +430,7 @@ function infer_stage1(args::Vector{String})
         println("  --show-ids                Show token IDs")
         println("  --force-cpu               Force CPU usage")
         println("  --sample                  Enable VAE resampling")
+        println("  --predict                 Decode predicted next capsule blocks")
         return
     end
     cli = Utils.parse_cli_args(args)

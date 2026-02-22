@@ -10,6 +10,7 @@ HMTR.main([
     "--meta-file", "/home/HMTR/data/processed_stream_char_20260218_111813_meta.jld2",
     "--checkpoint-dir", "/home/HMTR/checkpoints",
     "--checkpoint-prefix", "ckpt_no_teacher_forcing_stage1_stream_seq512",
+    "--resume-ckpt","home/HMTR/checkpoints/ckpt_no_teacher_forcing_stage1_stream_seq512_ds32_20260220_144006_epoch1_step30000.jld2",
     "--epochs", "2",
     "--batch-size", "8",
     "--lr", "1e-3",
