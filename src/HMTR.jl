@@ -20,6 +20,8 @@ include("data.jl")
 @reexport using .Data
 include("train_stage1.jl")
 @reexport using .TrainStage1
+include("train_stage2.jl")
+@reexport using .TrainStage2
 include("infer_stage1.jl")
 @reexport using .InferStage1
 
@@ -82,6 +84,7 @@ function main(args::Vector{String})
         println("Usage: julia hmtr.jl [command] [options...]")
         println("\nCommands:")
         println("  train_stage1 (alias: train) - Train the Stage 1 AutoEncoder")
+        println("  train_stage2               - Train the Stage 2 Reasoner")
         println("  infer_stage1 (alias: infer) - Run inference/sampling with Stage 1 model")
         println("  train_stage1_ve (alias: train_ve) - Train the Stage 1 VE AutoEncoder")
         println("  infer_stage1_ve (alias: infer_ve) - Run inference/sampling with VE model")
@@ -102,6 +105,12 @@ function main(args::Vector{String})
         TrainStage1.train_stage1(sub_args)
     elseif command == "infer" || command == "infer_stage1"
         InferStage1.infer_stage1(sub_args)
+    elseif command == "train_stage2"
+        if "--help" in sub_args || "-h" in sub_args
+            TrainStage2.train_stage2(sub_args)
+            return
+        end
+        TrainStage2.train_stage2(sub_args)
     elseif command == "train_ve" || command == "train_stage1_ve"
         if "--help" in sub_args || "-h" in sub_args
             VETrainStage1.train_stage1(sub_args)
@@ -118,7 +127,7 @@ function main(args::Vector{String})
         typecheck_entry(sub_args)
     else
         println("Unknown command: $command")
-        println("Available: train_stage1, infer_stage1, train_stage1_ve, infer_stage1_ve, data, lint, typecheck")
+        println("Available: train_stage1, train_stage2, infer_stage1, train_stage1_ve, infer_stage1_ve, data, lint, typecheck")
         exit(1)
     end
 end

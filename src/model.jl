@@ -56,6 +56,30 @@ end
 
 # --- Helper Layers ---
 
+struct LatentPredictor{L<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
+    layer::L
+end
+
+function LatentPredictor(dim::Int)
+    return LatentPredictor(Dense(dim => dim))
+end
+
+Lux.initialparameters(rng::AbstractRNG, l::LatentPredictor) = (
+    layer=Lux.initialparameters(rng, l.layer),
+)
+
+Lux.initialstates(rng::AbstractRNG, l::LatentPredictor) = (
+    layer=Lux.initialstates(rng, l.layer),
+)
+
+function (l::LatentPredictor)(x, ps, st)
+    Dim, Lcap, B = size(x)
+    x_flat = reshape(x, Dim, Lcap * B)
+    y_flat, st_layer = l.layer(x_flat, ps.layer, st.layer)
+    y = reshape(y_flat, Dim, Lcap, B)
+    return y, (layer=st_layer,)
+end
+
 # A simplified Selective Scan (Mamba-like)
 # y_t = SSM(x_t)
 # We implement a basic version that is runnable in pure Julia.
