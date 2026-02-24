@@ -1,0 +1,16 @@
+# Task list
+- [ ] Design and Implement MHC Strategy (Stage 2) <!-- id: 0 -->
+    - [x] Create Implementation Plan for MHC ([Plan](file:///Users/kael/workbench/HMTR/.agent/mhc_implementation_plan.md)) <!-- id: 1 -->
+    - [x] Update Implementation Plan for 4-Step Architecture <!-- id: 7 -->
+    - [x] Step 1 & 2: Base MHCLatentReasoner & Multi-stream Input <!-- id: 8 -->
+        - [x] Implement `sinkhorn_knopp` normalization in `src/model.jl` <!-- id: 9 -->
+        - [x] Define `MHCLatentReasoner` and `MHCBlock` struct (Transformer + $M$ Matrix) <!-- id: 2 -->
+        - [x] Implement Initial Mixing Layer for Dynamic Multi-stream Input <!-- id: 3 -->
+        - [x] Create `verify_mhc.jl` to validate multi-stream forward pass and doubly stochastic constraints <!-- id: 4 -->
+    - [ ] Step 3: Task Encoder & Operator <!-- id: 5 -->
+        - [ ] Define Mamba-based Task Encoder <!-- id: 14 -->
+        - [ ] Implement Task Operator for input modulation <!-- id: 15 -->
+    - [ ] Step 4: Test-Time Training (TTT) Integration <!-- id: 10 -->
+        - [ ] Add TTT Dual Path to `MHCBlock` <!-- id: 16 -->
+    - [x] Optimize Stage 1 Loss & Logging (Normalize Pred Loss, Add Latent Stats) <!-- id: 12 -->
+    - [x] Fix Numerical Instability (Clamp dt in Mamba, Reset State on NaN) <!-- id: 13 -->
