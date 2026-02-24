@@ -82,9 +82,9 @@ function resolve_config(cli::Dict{Symbol, Any})
     block_size = parse(Int, string(get(cli, :block_size, BLOCK_SIZE)))
     seq_len = parse(Int, string(get(cli, :seq_len, SEQ_LEN)))
 
-    skip_on_spike = parse_bool("SKIP_ON_SPIKE", SKIP_ON_SPIKE) || string(get(cli, :skip_on_spike, SKIP_ON_SPIKE)) in ("true", "1")
+    skip_on_spike = haskey(cli, :skip_on_spike) ? string(get(cli, :skip_on_spike, "0")) in ("true", "1") : parse_bool("SKIP_ON_SPIKE", SKIP_ON_SPIKE)
     force_cpu = string(get(cli, :force_cpu, FORCE_CPU)) in ("true", "1")
-    add_timestamp = string(get(cli, :add_timestamp, ADD_TIMESTAMP)) in ("true", "1")
+    add_timestamp = haskey(cli, :add_timestamp) ? string(get(cli, :add_timestamp, "1")) in ("true", "1") : string(get(ENV, "ADD_TIMESTAMP", ADD_TIMESTAMP)) in ("true", "1")
 
     if !isempty(resume_ckpt) && !isfile(resume_ckpt)
         alt_path = joinpath(checkpoint_dir, basename(resume_ckpt))
@@ -432,6 +432,10 @@ function train_stage2(args::Vector{String})
         println("  --num-layers <int>        Number of MHC blocks (default: $NUM_LAYERS)")
         println("  --block-size <int>        Encoder block size (default: $BLOCK_SIZE)")
         println("  --seq-len <int>           Stream seq len (default: $SEQ_LEN)")
+        println("  --grad-clip-norm <float>  Gradient clip norm (default: $GRAD_CLIP_NORM)")
+        println("  --loss-spike-threshold <float> Loss spike threshold (default: $LOSS_SPIKE_THRESHOLD)")
+        println("  --skip-on-spike           Skip updates on loss spikes (default: $SKIP_ON_SPIKE)")
+        println("  --add-timestamp           Add timestamp to checkpoint prefix (default: $ADD_TIMESTAMP)")
         println("  --force-cpu               Force CPU usage")
         return
     end
