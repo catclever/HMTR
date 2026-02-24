@@ -9,7 +9,7 @@ using LuxCUDA
 import ChainRulesCore
 import ChainRulesCore
 
-export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, LatentPredictor, NanoDecoder, HMTR_Stage1_AutoEncoder
+export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentPredictor, NanoDecoder, HMTR_Stage1_AutoEncoder, MHCBlock, MHCLatentReasoner, InitialMixingLayer
 
 hippo_A_diag(d_state::Int, ::Type{T}=Float32) where {T<:AbstractFloat} = -(T.(collect(1:d_state)))
 
@@ -386,64 +386,159 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
 
     return (mu, logvar), (embedding=st_emb, layers=st_layers, head=st_head)
 end
+# --- 3. Transformer Reasoner (MHC Stage 2) ---
 
-# --- 2. Latent Predictor (JEPA Head) ---
+# Sinkhorn-Knopp Normalization for Doubly Stochastic Matrices
+# M: [K, K] or [K, K, B]
+function sinkhorn_knopp(M::AbstractArray{T}; iters::Int=5, eps::T=T(1e-6)) where T
+    # M is shape [K, K] or [K, K, B]
+    # Make strictly positive
+    P = exp.(M)
+    
+    for _ in 1:iters
+        # Row normalize
+        row_sum = sum(P; dims=2)
+        P = P ./ (row_sum .+ eps)
+        # Col normalize
+        col_sum = sum(P; dims=1)
+        P = P ./ (col_sum .+ eps)
+    end
+    return P
+end
 
-struct LatentPredictor{L<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
-    layers::L
+# To support Sinkhorn in Zygote properly without custom adjoints for now, 
+# the unrolled loop is differentiable.
+
+struct SelfAttentionWrapper{M<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
+    mha::M
+end
+function SelfAttentionWrapper(dim::Int, heads::Int)
+    return SelfAttentionWrapper(MultiHeadAttention(dim; nheads=heads))
+end
+Lux.initialparameters(rng::AbstractRNG, w::SelfAttentionWrapper) = (mha=Lux.initialparameters(rng, w.mha),)
+Lux.initialstates(rng::AbstractRNG, w::SelfAttentionWrapper) = (mha=Lux.initialstates(rng, w.mha),)
+function (w::SelfAttentionWrapper)(x, ps, st)
+    # x: [Dim, Seq, Batch]
+    # MHA expects tuple (Q, K, V)
+    # Returns (y, (attention_weights,)), st
+    (y, _), st_mha = w.mha((x, x, x), ps.mha, st.mha)
+    return y, (mha=st_mha,)
+end
+
+struct MHCBlock{T<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
+    transformer_block::T
+    K_streams::Int
+end
+
+function MHCBlock(dim::Int, K_streams::Int, heads::Int=8)
+    # A standard Pre-Norm Transformer Block
+    transformer_block = Chain(
+        SkipConnection(
+            Chain(FeatureLayerNorm(dim), SelfAttentionWrapper(dim, heads)),
+            +
+        ),
+        SkipConnection(
+            Chain(FeatureLayerNorm(dim), Dense(dim => 4dim, NNlib.gelu), Dense(4dim => dim)),
+            +
+        )
+    )
+    return MHCBlock(transformer_block, K_streams)
+end
+
+Lux.initialparameters(rng::AbstractRNG, m::MHCBlock) = (
+    transformer_block=Lux.initialparameters(rng, m.transformer_block),
+    # Learnable pre-mixing logits M_raw: [K, K]
+    M_raw=randn(rng, Float32, m.K_streams, m.K_streams) .* 0.02f0
+)
+
+Lux.initialstates(rng::AbstractRNG, m::MHCBlock) = (
+    transformer_block=Lux.initialstates(rng, m.transformer_block),
+)
+
+function (m::MHCBlock)(x, ps, st)
+    # x: [Dim, K, L_seq, Batch]
+    Dim, K, L, B = size(x)
+    
+    # 1. Manifold-Constrained Hyper-Connections (Mixing)
+    # M: [K, K] -> Doubly Stochastic
+    M = sinkhorn_knopp(ps.M_raw)
+    
+    # Mix across the K streams (dim 2)
+    # x is [Dim, K, L, B], we want to multiply K dimension.
+    # Permute to [K, Dim, L, B], reshape to [K, Dim * L * B]
+    x_perm = permutedims(x, (2, 1, 3, 4))
+    x_flat = reshape(x_perm, K, :)
+    
+    # M * x_flat -> [K, Dim * L * B]
+    x_mixed_flat = M * x_flat
+    
+    # Reshape and permute back to [Dim, K, L, B]
+    x_mixed_perm = reshape(x_mixed_flat, K, Dim, L, B)
+    x_mixed = permutedims(x_mixed_perm, (2, 1, 3, 4))
+    
+    # 2. Transformer Logic
+    # Apply standard shared transformer to each stream independently (or treat K*B as batch)
+    # transformer expects [Dim, L, Batch_effective]
+    # In Lux, MultiHeadAttention usually expects [Dim, SeqLen, Batch]
+    x_in_tf = reshape(x_mixed, Dim, L, K * B)
+    
+    x_out_tf, st_tf = m.transformer_block(x_in_tf, ps.transformer_block, st.transformer_block)
+    
+    # Reshape back to [Dim, K, L, B]
+    x_out = reshape(x_out_tf, Dim, K, L, B)
+    
+    return x_out, (transformer_block=st_tf,)
+end
+
+struct MHCLatentReasoner{L<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
+    blocks::L
+    K_streams::Int
     dim::Int
 end
 
-function LatentPredictor(dim::Int, hidden_dim::Int=0)
-    # Simple MLP predictor: z_t -> hidden -> z_{t+1}
-    # If hidden_dim is 0, default to 2*dim
-    h_dim = hidden_dim > 0 ? hidden_dim : 2 * dim
-    layers = Chain(
-        Dense(dim => h_dim, NNlib.gelu),
-        Dense(h_dim => h_dim, NNlib.gelu),
-        Dense(h_dim => dim)
-    )
-    return LatentPredictor(layers, dim)
+function MHCLatentReasoner(dim::Int, K_streams::Int=4, heads::Int=8, num_layers::Int=4)
+    # Initial Mixing / Expansion from 1 stream to K streams is handled outside or as a first step.
+    # We assume input to Reasoner is already [Dim, K, L, B].
+    blocks = Chain([MHCBlock(dim, K_streams, heads) for _ in 1:num_layers]...)
+    return MHCLatentReasoner(blocks, K_streams, dim)
 end
 
-Lux.initialparameters(rng::AbstractRNG, p::LatentPredictor) = (layers=Lux.initialparameters(rng, p.layers),)
-Lux.initialstates(rng::AbstractRNG, p::LatentPredictor) = (layers=Lux.initialstates(rng, p.layers),)
+Lux.initialparameters(rng::AbstractRNG, r::MHCLatentReasoner) = (blocks=Lux.initialparameters(rng, r.blocks),)
+Lux.initialstates(rng::AbstractRNG, r::MHCLatentReasoner) = (blocks=Lux.initialstates(rng, r.blocks),)
 
-function (p::LatentPredictor)(z::AbstractArray, ps, st)
-    # z: [Dim, B] or [Dim, N, B]
-    y, st_layers = p.layers(z, ps.layers, st.layers)
-    return y, (layers=st_layers,)
+function (r::MHCLatentReasoner)(x, ps, st)
+    # x: [Dim, K, Seq, Batch]
+    y, st_blocks = r.blocks(x, ps.blocks, st.blocks)
+    return y, (blocks=st_blocks,)
 end
 
-# --- 3. Transformer Reasoner (Optional Future) ---
-# Keeping typical Transformer structure but commenting out or leaving for reference
-# (The user wanted independent modules, LatentPredictor is the new component for Stage 1.5)
-
-struct LatentReasoner{T<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
-    transformer::T
+# --- Integration / Helper: Initial Mixing Layer ---
+# Expands [Dim, L, B] to [Dim, K, L, B] using learned offsets (simplest unconditioned formulation)
+struct InitialMixingLayer <: Lux.AbstractLuxLayer
+    dim::Int
+    K_streams::Int
 end
 
-function LatentReasoner(dim::Int, heads::Int=8, layers::Int=4)
-    blocks = [
-        Chain(
-            SkipConnection(
-                Chain(FeatureLayerNorm(dim), MultiHeadAttention(dim, nheads=heads)),
-                +
-            ),
-            SkipConnection(
-                Chain(FeatureLayerNorm(dim), Dense(dim => 4dim, gelu), Dense(4dim => dim)),
-                +
-            )
-        ) for _ in 1:layers
-    ]
-    return LatentReasoner(Chain(blocks...))
-end
+Lux.initialparameters(rng::AbstractRNG, l::InitialMixingLayer) = (
+    offsets=randn(rng, Float32, l.dim, l.K_streams) .* 0.02f0,
+)
+Lux.initialstates(rng::AbstractRNG, l::InitialMixingLayer) = NamedTuple()
 
-Lux.initialparameters(rng::AbstractRNG, r::LatentReasoner) = (transformer=Lux.initialparameters(rng, r.transformer),)
-Lux.initialstates(rng::AbstractRNG, r::LatentReasoner) = (transformer=Lux.initialstates(rng, r.transformer),)
-
-function (r::LatentReasoner)(x, ps, st)
-    return r.transformer(x, ps.transformer, st.transformer)
+function (l::InitialMixingLayer)(x, ps, st)
+    # x: [Dim, L, B]
+    Dim, L, B = size(x)
+    
+    # Add offsets to create K streams
+    # x_exp: [Dim, 1, L, B]
+    x_exp = reshape(x, Dim, 1, L, B)
+    
+    # offsets_exp: [Dim, K, 1, 1]
+    offsets_exp = reshape(ps.offsets, Dim, l.K_streams, 1, 1)
+    
+    # Broadcasting plus: [Dim, K, L, B]
+    x_k = x_exp .+ offsets_exp
+    
+    return x_k, st
 end
 
 
