@@ -6,6 +6,7 @@ using NNlib
 using Zygote
 using CUDA
 using LuxCUDA
+using Statistics
 import ChainRulesCore
 import ChainRulesCore
 
@@ -449,12 +450,27 @@ function (w::SelfAttentionWrapper)(x, ps, st)
     return y, (mha=st_mha,)
 end
 
+function k_drop_mask(x::AbstractArray, k_drop_threshold::Float32, k_drop_min::Int)
+    scores = dropdims(Statistics.mean(abs2, x; dims=(1, 3, 4)); dims=(1, 3, 4))
+    scores_vec = vec(scores)
+    keep = scores_vec .>= k_drop_threshold
+    if count(keep) < k_drop_min
+        order = sortperm(scores_vec; rev=true)
+        top = view(order, 1:k_drop_min)
+        keep = in.(1:length(scores_vec), Ref(top))
+    end
+    return ifelse.(keep, one(eltype(x)), zero(eltype(x)))
+end
+Zygote.@nograd k_drop_mask
+
 struct MHCBlock{T<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
     transformer_block::T
     K_streams::Int
+    k_drop_threshold::Float32
+    k_drop_min::Int
 end
 
-function MHCBlock(dim::Int, K_streams::Int, heads::Int=8)
+function MHCBlock(dim::Int, K_streams::Int, heads::Int=8; k_drop_threshold::Float32=0f0, k_drop_min::Int=1)
     # A standard Pre-Norm Transformer Block
     transformer_block = Chain(
         SkipConnection(
@@ -466,7 +482,8 @@ function MHCBlock(dim::Int, K_streams::Int, heads::Int=8)
             +
         )
     )
-    return MHCBlock(transformer_block, K_streams)
+    kmin = max(1, min(k_drop_min, K_streams))
+    return MHCBlock(transformer_block, K_streams, k_drop_threshold, kmin)
 end
 
 Lux.initialparameters(rng::AbstractRNG, m::MHCBlock) = (
@@ -484,6 +501,12 @@ function (m::MHCBlock)(x, ps, st)
     Dim, K, L, B = size(x)
     
     # 1. Manifold-Constrained Hyper-Connections (Mixing)
+    if m.k_drop_threshold > 0f0 && K > m.k_drop_min
+        mask_vals = k_drop_mask(x, m.k_drop_threshold, m.k_drop_min)
+        mask = reshape(mask_vals, 1, K, 1, 1)
+        x = x .* mask
+    end
+
     # M: [K, K] -> Doubly Stochastic
     M = sinkhorn_knopp(ps.M_raw)
     
@@ -520,10 +543,10 @@ struct MHCLatentReasoner{L<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
     dim::Int
 end
 
-function MHCLatentReasoner(dim::Int, K_streams::Int=4, heads::Int=8, num_layers::Int=4)
+function MHCLatentReasoner(dim::Int, K_streams::Int=4, heads::Int=8, num_layers::Int=4; k_drop_threshold::Float32=0f0, k_drop_min::Int=1)
     # Initial Mixing / Expansion from 1 stream to K streams is handled outside or as a first step.
     # We assume input to Reasoner is already [Dim, K, L, B].
-    blocks = Chain([MHCBlock(dim, K_streams, heads) for _ in 1:num_layers]...)
+    blocks = Chain([MHCBlock(dim, K_streams, heads; k_drop_threshold=k_drop_threshold, k_drop_min=k_drop_min) for _ in 1:num_layers]...)
     return MHCLatentReasoner(blocks, K_streams, dim)
 end
 

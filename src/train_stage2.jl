@@ -33,6 +33,8 @@ const ADD_TIMESTAMP = parse(Int, get(ENV, "ADD_TIMESTAMP", "1"))
 const GRAD_CLIP_NORM = parse(Float64, get(ENV, "GRAD_CLIP_NORM", "5.0"))
 const LOSS_SPIKE_THRESHOLD = parse(Float64, get(ENV, "LOSS_SPIKE_THRESHOLD", "10.0"))
 const SKIP_ON_SPIKE = parse(Int, get(ENV, "SKIP_ON_SPIKE", "1"))
+const K_DROP_THRESHOLD = parse(Float64, get(ENV, "K_DROP_THRESHOLD", "0.0"))
+const K_DROP_MIN = parse(Int, get(ENV, "K_DROP_MIN", "1"))
 const WARMUP_STEPS = parse(Int, get(ENV, "WARMUP_STEPS", "500"))
 const FORCE_CPU = parse(Int, get(ENV, "FORCE_CPU", "0"))
 const K_STREAMS = parse(Int, get(ENV, "K_STREAMS", "4"))
@@ -102,8 +104,11 @@ function resolve_config(cli::Dict{Symbol, Any})
 
     grad_clip_norm = parse(Float64, string(get(cli, :grad_clip_norm, GRAD_CLIP_NORM)))
     loss_spike_threshold = parse(Float64, string(get(cli, :loss_spike_threshold, LOSS_SPIKE_THRESHOLD)))
+    k_drop_threshold = parse(Float64, string(get(cli, :k_drop_threshold, K_DROP_THRESHOLD)))
+    k_drop_min_raw = parse(Int, string(get(cli, :k_drop_min, K_DROP_MIN)))
+    k_drop_min = max(1, min(k_drop_min_raw, k_streams))
 
-    return (; data_file, meta_file, checkpoint_dir, checkpoint_prefix, stage1_ckpt, resume_ckpt, epochs, batch_size, lr, max_batches, save_every, warmup_steps, k_streams, heads, num_layers, block_size, seq_len, skip_on_spike, force_cpu, grad_clip_norm, loss_spike_threshold)
+    return (; data_file, meta_file, checkpoint_dir, checkpoint_prefix, stage1_ckpt, resume_ckpt, epochs, batch_size, lr, max_batches, save_every, warmup_steps, k_streams, heads, num_layers, block_size, seq_len, skip_on_spike, force_cpu, grad_clip_norm, loss_spike_threshold, k_drop_threshold, k_drop_min)
 end
 
 function select_device(force_cpu::Bool)
@@ -236,7 +241,7 @@ function train(cfg)
     rng = Random.default_rng()
     Random.seed!(rng, 42)
     mixer = InitialMixingLayer(dim, cfg.k_streams)
-    reasoner = MHCLatentReasoner(dim, cfg.k_streams, cfg.heads, cfg.num_layers)
+    reasoner = MHCLatentReasoner(dim, cfg.k_streams, cfg.heads, cfg.num_layers; k_drop_threshold=Float32(cfg.k_drop_threshold), k_drop_min=cfg.k_drop_min)
     ps_mix, st_mix = Lux.setup(rng, mixer)
     ps_reas, st_reas = Lux.setup(rng, reasoner)
     ps2 = (; mixer=ps_mix, reasoner=ps_reas)
@@ -387,6 +392,8 @@ function train(cfg)
                     heads=cfg.heads,
                     num_layers=cfg.num_layers,
                     block_size=cfg.block_size,
+                    k_drop_threshold=cfg.k_drop_threshold,
+                    k_drop_min=cfg.k_drop_min,
                 )
             end
         end
@@ -408,6 +415,8 @@ function train(cfg)
             heads=cfg.heads,
             num_layers=cfg.num_layers,
             block_size=cfg.block_size,
+            k_drop_threshold=cfg.k_drop_threshold,
+            k_drop_min=cfg.k_drop_min,
         )
     end
 end
@@ -436,6 +445,8 @@ function train_stage2(args::Vector{String})
         println("  --loss-spike-threshold <float> Loss spike threshold (default: $LOSS_SPIKE_THRESHOLD)")
         println("  --skip-on-spike           Skip updates on loss spikes (default: $SKIP_ON_SPIKE)")
         println("  --add-timestamp           Add timestamp to checkpoint prefix (default: $ADD_TIMESTAMP)")
+        println("  --k-drop-threshold <float> K-drop threshold (default: $K_DROP_THRESHOLD)")
+        println("  --k-drop-min <int>        Minimum kept streams after K-drop (default: $K_DROP_MIN)")
         println("  --force-cpu               Force CPU usage")
         return
     end
