@@ -209,11 +209,11 @@ function compute_loss(mixer, reasoner, ps2, st2, capsules)
     pred = @view y_mean[:, 1:end-1, :]
     
     # Cosine Distance Loss to prevent Regression to the Mean
-    pred_normsq = sum(abs2, pred; dims=1) .+ 1e-6f0
-    target_normsq = sum(abs2, target; dims=1) .+ 1e-6f0
+    pred_normsq = sum(abs2, pred; dims=1) .+ Float32(1e-6)
+    target_normsq = sum(abs2, target; dims=1) .+ Float32(1e-6)
     dot_product = sum(pred .* target; dims=1)
     cos_sim = dot_product ./ sqrt.(pred_normsq .* target_normsq)
-    loss = mean(1.0f0 .- cos_sim)
+    loss = mean(Float32(1.0) .- cos_sim)
     
     return loss, (mixer=st_mix, reasoner=st_reas), (; pred=loss, lcap=Lcap)
 end
