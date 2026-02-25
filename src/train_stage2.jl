@@ -207,7 +207,14 @@ function compute_loss(mixer, reasoner, ps2, st2, capsules)
     end
     target = Zygote.dropgrad(@view capsules[:, 2:end, :])
     pred = @view y_mean[:, 1:end-1, :]
-    loss = mean(abs2, pred .- target)
+    
+    # Cosine Distance Loss to prevent Regression to the Mean
+    pred_normsq = sum(abs2, pred; dims=1) .+ 1e-6f0
+    target_normsq = sum(abs2, target; dims=1) .+ 1e-6f0
+    dot_product = sum(pred .* target; dims=1)
+    cos_sim = dot_product ./ sqrt.(pred_normsq .* target_normsq)
+    loss = mean(1.0f0 .- cos_sim)
+    
     return loss, (mixer=st_mix, reasoner=st_reas), (; pred=loss, lcap=Lcap)
 end
 

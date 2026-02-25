@@ -8,7 +8,7 @@ using CUDA
 using LuxCUDA
 using Statistics
 import ChainRulesCore
-import ChainRulesCore
+using LinearAlgebra
 
 export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentPredictor, NanoDecoder, HMTR_Stage1_AutoEncoder, MHCBlock, MHCLatentReasoner, InitialMixingLayer
 
@@ -442,12 +442,65 @@ function SelfAttentionWrapper(dim::Int, heads::Int)
 end
 Lux.initialparameters(rng::AbstractRNG, w::SelfAttentionWrapper) = (mha=Lux.initialparameters(rng, w.mha),)
 Lux.initialstates(rng::AbstractRNG, w::SelfAttentionWrapper) = (mha=Lux.initialstates(rng, w.mha),)
-function (w::SelfAttentionWrapper)(x, ps, st)
+function (w::SelfAttentionWrapper)(x, ps, st; mask=nothing)
     # x: [Dim, Seq, Batch]
-    # MHA expects tuple (Q, K, V)
+    # MHA expects tuple (Q, K, V) or (Q, K, V, mask)
     # Returns (y, (attention_weights,)), st
-    (y, _), st_mha = w.mha((x, x, x), ps.mha, st.mha)
+    if mask === nothing
+        (y, _), st_mha = w.mha((x, x, x), ps.mha, st.mha)
+    else
+        (y, _), st_mha = w.mha((x, x, x, mask), ps.mha, st.mha)
+    end
     return y, (mha=st_mha,)
+end
+
+struct MHCTransformerBlock{N1, A, N2, F1, F2} <: Lux.AbstractLuxLayer
+    norm1::N1
+    attn::A
+    norm2::N2
+    ffn1::F1
+    ffn2::F2
+end
+
+function MHCTransformerBlock(dim::Int, heads::Int)
+    return MHCTransformerBlock(
+        FeatureLayerNorm(dim),
+        SelfAttentionWrapper(dim, heads),
+        FeatureLayerNorm(dim),
+        Dense(dim => 4dim, NNlib.gelu),
+        Dense(4dim => dim)
+    )
+end
+
+Lux.initialparameters(rng::AbstractRNG, m::MHCTransformerBlock) = (
+    norm1=Lux.initialparameters(rng, m.norm1),
+    attn=Lux.initialparameters(rng, m.attn),
+    norm2=Lux.initialparameters(rng, m.norm2),
+    ffn1=Lux.initialparameters(rng, m.ffn1),
+    ffn2=Lux.initialparameters(rng, m.ffn2)
+)
+
+Lux.initialstates(rng::AbstractRNG, m::MHCTransformerBlock) = (
+    norm1=Lux.initialstates(rng, m.norm1),
+    attn=Lux.initialstates(rng, m.attn),
+    norm2=Lux.initialstates(rng, m.norm2),
+    ffn1=Lux.initialstates(rng, m.ffn1),
+    ffn2=Lux.initialstates(rng, m.ffn2)
+)
+
+function (m::MHCTransformerBlock)(x, ps, st; mask=nothing)
+    # Attention block with pre-norm and residual
+    x_norm, st_norm1 = m.norm1(x, ps.norm1, st.norm1)
+    y_attn, st_attn = m.attn(x_norm, ps.attn, st.attn; mask=mask)
+    x = x .+ y_attn
+    
+    # FFN block with pre-norm and residual
+    x_norm2, st_norm2 = m.norm2(x, ps.norm2, st.norm2)
+    y_ffn1, st_ffn1 = m.ffn1(x_norm2, ps.ffn1, st.ffn1)
+    y_ffn, st_ffn2 = m.ffn2(y_ffn1, ps.ffn2, st.ffn2)
+    x = x .+ y_ffn
+    
+    return x, (norm1=st_norm1, attn=st_attn, norm2=st_norm2, ffn1=st_ffn1, ffn2=st_ffn2)
 end
 
 function k_drop_mask(x::AbstractArray, k_drop_threshold::Float32, k_drop_min::Int)
@@ -471,17 +524,8 @@ struct MHCBlock{T<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
 end
 
 function MHCBlock(dim::Int, K_streams::Int, heads::Int=8; k_drop_threshold::Float32=0f0, k_drop_min::Int=1)
-    # A standard Pre-Norm Transformer Block
-    transformer_block = Chain(
-        SkipConnection(
-            Chain(FeatureLayerNorm(dim), SelfAttentionWrapper(dim, heads)),
-            +
-        ),
-        SkipConnection(
-            Chain(FeatureLayerNorm(dim), Dense(dim => 4dim, NNlib.gelu), Dense(4dim => dim)),
-            +
-        )
-    )
+    # A standard Pre-Norm Transformer Block with custom wrapper to support kwargs
+    transformer_block = MHCTransformerBlock(dim, heads)
     kmin = max(1, min(k_drop_min, K_streams))
     return MHCBlock(transformer_block, K_streams, k_drop_threshold, kmin)
 end
@@ -523,13 +567,26 @@ function (m::MHCBlock)(x, ps, st)
     x_mixed_perm = reshape(x_mixed_flat, K, Dim, L, B)
     x_mixed = permutedims(x_mixed_perm, (2, 1, 3, 4))
     
+    # Add Positional Encoding
+    pos = sinusoidal_position_encoding(x_mixed, Dim, L)
+    # pos is [Dim, L, 1]
+    # x_mixed is [Dim, K, L, B], reshape pos to [Dim, 1, L, 1] for broadcasting
+    pos_exp = reshape(pos, Dim, 1, L, 1)
+    x_mixed = x_mixed .+ pos_exp
+
     # 2. Transformer Logic
     # Apply standard shared transformer to each stream independently (or treat K*B as batch)
     # transformer expects [Dim, L, Batch_effective]
-    # In Lux, MultiHeadAttention usually expects [Dim, SeqLen, Batch]
     x_in_tf = reshape(x_mixed, Dim, L, K * B)
     
-    x_out_tf, st_tf = m.transformer_block(x_in_tf, ps.transformer_block, st.transformer_block)
+    # Create Causal Mask for L steps
+    # Mask should be [L, L] (or [L, L, 1] depending on MultiHeadAttention implementation)
+    # For Lux MultiHeadAttention, a 2D mask [L, L] is broadcasted across batch/heads.
+    # We want a boolean lower triangular mask where true means keep, false means mask.
+    causal_mask_cpu = LinearAlgebra.tril(ones(Bool, L, L))
+    causal_mask = x_in_tf isa CUDA.AbstractGPUArray ? CUDA.CuArray(causal_mask_cpu) : causal_mask_cpu
+    
+    x_out_tf, st_tf = m.transformer_block(x_in_tf, ps.transformer_block, st.transformer_block; mask=causal_mask)
     
     # Reshape back to [Dim, K, L, B]
     x_out = reshape(x_out_tf, Dim, K, L, B)
