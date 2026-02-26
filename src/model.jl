@@ -359,29 +359,31 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     # Lux Embedding: (in::AbstractVector) -> [out, in]
     # (in::AbstractMatrix) -> [out, in_1, in_2] => [Dim, L, B]
 
-    emb, st_emb = m.embedding(x, ps.embedding, st.embedding)
-    # emb: [Dim, Seq, Batch]
-
-    hidden, st_layers = m.layers(emb, ps.layers, st.layers)
-
-    seq_len = size(hidden, 2)
-    B = size(hidden, 3)
-
+    seq_len_in = size(x, 1)
+    B = size(x, 2)
     stride = max(m.block_size, 1)
-    Lpad = (seq_len % stride == 0) ? seq_len : (seq_len + (stride - (seq_len % stride)))
-    Lcap = Lpad ÷ stride
 
-    hidden_pad = if Lpad == seq_len
-        hidden
+    # Pad x to a multiple of block_size before passing to Mamba
+    Lpad = (seq_len_in % stride == 0) ? seq_len_in : (seq_len_in + (stride - (seq_len_in % stride)))
+
+    x_pad = if Lpad == seq_len_in
+        x
     else
-        pad_part = similar(hidden, size(hidden, 1), Lpad - seq_len, B)
-        Zygote.@ignore fill!(pad_part, zero(eltype(pad_part)))
-        cat(hidden, pad_part; dims=2)
+        pad_part = similar(x, Lpad - seq_len_in, B)
+        Zygote.@ignore fill!(pad_part, m.pad_id)
+        cat(x, pad_part; dims=1)
     end
 
-    hidden4 = reshape(hidden_pad, size(hidden_pad, 1), stride, Lcap, B)
-    rem = seq_len - (Lcap - 1) * stride
-    pooled_slices = ntuple(c -> reshape(@view(hidden4[:, c == Lcap ? rem : stride, c, :]), size(hidden4, 1), 1, B), Lcap)
+    emb, st_emb = m.embedding(x_pad, ps.embedding, st.embedding)
+    hidden, st_layers = m.layers(emb, ps.layers, st.layers)
+
+    seq_len = Lpad
+    Lcap = Lpad ÷ stride
+
+    # hidden is already padded
+    hidden4 = reshape(hidden, size(hidden, 1), stride, Lcap, B)
+    # Always pool at `stride` since sequence is padded to full blocks
+    pooled_slices = ntuple(c -> reshape(@view(hidden4[:, stride, c, :]), size(hidden4, 1), 1, B), Lcap)
     pooled = cat(pooled_slices...; dims=2)
     
     # helper for view preservation and batching
