@@ -553,8 +553,8 @@ function (m::MHCBlock)(x, ps, st)
         x = x .* mask
     end
 
-    # M: [K, K] -> Doubly Stochastic
-    M = sinkhorn_knopp(ps.M_raw)
+    # M: [K, K] -> Doubly Stochastic (Slice dynamically support varying stream counts)
+    M = sinkhorn_knopp(ps.M_raw[1:K, 1:K])
     
     # Mix across the K streams (dim 2)
     # x is [Dim, K, L, B], we want to multiply K dimension.
@@ -619,7 +619,7 @@ function (r::MHCLatentReasoner)(x, ps, st)
 end
 
 # --- Integration / Helper: Initial Mixing Layer ---
-# Expands [Dim, L, B] to [Dim, K, L, B] using learned offsets (simplest unconditioned formulation)
+# Expands [Dim, L, B] to [Dim, K_dyn, L, B] using variance noise and learned offsets
 struct InitialMixingLayer <: Lux.AbstractLuxLayer
     dim::Int
     K_streams::Int
@@ -630,22 +630,33 @@ Lux.initialparameters(rng::AbstractRNG, l::InitialMixingLayer) = (
 )
 Lux.initialstates(rng::AbstractRNG, l::InitialMixingLayer) = NamedTuple()
 
-function (l::InitialMixingLayer)(x, ps, st)
-    # x: [Dim, L, B]
-    Dim, L, B = size(x)
+function (l::InitialMixingLayer)(capsules::Tuple, K_dyn::Int, ps, st)
+    # capsules is (mu, logvar) from Mamba. Both are [Dim, L, B]
+    mu, logvar = capsules
+    Dim, L, B = size(mu)
     
-    # Add offsets to create K streams
-    # x_exp: [Dim, 1, L, B]
-    x_exp = reshape(x, Dim, 1, L, B)
+    # 1. Expand mu to [Dim, K_dyn, L, B]
+    mu_exp = reshape(mu, Dim, 1, L, B)
+
+    # 2. Add fixed semantic offsets for the active streams
+    offsets_exp = reshape(@view(ps.offsets[:, 1:K_dyn]), Dim, K_dyn, 1, 1)
     
-    # offsets_exp: [Dim, K, 1, 1]
-    offsets_exp = reshape(ps.offsets, Dim, l.K_streams, 1, 1)
+    # 3. Apply variance noise (Reparameterization trick)
+    # epsilon: [Dim, K_dyn, L, B]
+    epsilon_cpu = randn(Float32, Dim, K_dyn, L, B)
+    epsilon = mu isa CUDA.AbstractGPUArray ? CUDA.CuArray(epsilon_cpu) : epsilon_cpu
+    epsilon = Zygote.dropgrad(epsilon)
     
-    # Broadcasting plus: [Dim, K, L, B]
-    x_k = x_exp .+ offsets_exp
+    # logvar is [Dim, 1, L, B] (Needs reshape for broadcast)
+    logvar_exp = reshape(logvar, Dim, 1, L, B)
+    sigma = exp.(0.5f0 .* logvar_exp)
+    
+    # z_k = mu + epsilon * sigma + offset
+    x_k = mu_exp .+ (epsilon .* sigma) .+ offsets_exp
     
     return x_k, st
 end
+
 
 
 # --- 3. Nano Decoder ---

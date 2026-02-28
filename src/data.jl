@@ -29,8 +29,10 @@ function resolve_config(cli::Dict{Symbol,Any})
     char_vocab_docs = parse(Int, string(get(cli, :char_vocab_docs, DEFAULT_CHAR_VOCAB_DOCS)))
     output_file = string(get(cli, :output_file, ""))
     meta_file = string(get(cli, :meta_file, DEFAULT_META_FILE))
+    paragraph_eos_str = string(get(cli, :paragraph_eos, "false"))
+    paragraph_eos = lowercase(paragraph_eos_str) == "true" || paragraph_eos_str == "1"
 
-    return (; data_dir, parquet_file, tokenizer_name, max_docs, char_vocab_docs, output_file, meta_file)
+    return (; data_dir, parquet_file, tokenizer_name, max_docs, char_vocab_docs, output_file, meta_file, paragraph_eos)
 end
 
 function resolve_output_file(mode::AbstractString, data_dir::AbstractString, tokenizer_name::AbstractString; output_file::AbstractString="")
@@ -152,7 +154,7 @@ function encode_chars(s::String, char_map, unk_id::Int)
     return out
 end
 
-function process_data_char_stream(texts, output_file::AbstractString, meta_file::AbstractString, char_vocab_docs::Int)
+function process_data_char_stream(texts, output_file::AbstractString, meta_file::AbstractString, char_vocab_docs::Int, paragraph_eos::Bool)
     sample_texts = texts[1:min(end, char_vocab_docs)]
     vocab_chars = sort!(collect(build_char_set(sample_texts)))
 
@@ -180,22 +182,32 @@ function process_data_char_stream(texts, output_file::AbstractString, meta_file:
         s = normalize_text(doc)
         isempty(s) && continue
 
-        # No sentence splitting! Continuous document.
-        ids = encode_chars(s, char_map, UNK_ID)
-        if isempty(ids)
-            continue
+        # Track if this is the very first token of the document
+        is_first_doc_token = true
+
+        # Split document into paragraphs if paragraph_eos is true
+        paragraphs = paragraph_eos ? split(s, r"\n+") : [s]
+        for paragraph in paragraphs
+            p_text = paragraph_eos ? String(strip(paragraph)) : String(paragraph)
+            isempty(p_text) && continue
+
+            ids = encode_chars(p_text, char_map, UNK_ID)
+            if isempty(ids)
+                continue
+            end
+
+            # Append EOS at end of paragraph
+            push!(ids, EOS_ID)
+
+            doc_resets = falses(length(ids))
+            if is_first_doc_token
+                doc_resets[1] = true
+                is_first_doc_token = false
+            end
+
+            append!(all_tokens, ids)
+            append!(reset_flags, doc_resets)
         end
-
-        # Append EOS at end of document
-        push!(ids, EOS_ID)
-
-        # Mark reset at the BEGINNING of this document segment
-        # First token of this doc gets reset=true
-        doc_resets = falses(length(ids))
-        doc_resets[1] = true
-
-        append!(all_tokens, ids)
-        append!(reset_flags, doc_resets)
     end
 
     id_to_token = fill("", vocab_size + 1)
@@ -231,7 +243,7 @@ function process_data_char_stream(texts, output_file::AbstractString, meta_file:
     println("Done.")
 end
 
-function process_data_tokenizer_stream(texts, output_file::AbstractString, meta_file::AbstractString, tokenizer_name::AbstractString)
+function process_data_tokenizer_stream(texts, output_file::AbstractString, meta_file::AbstractString, tokenizer_name::AbstractString, paragraph_eos::Bool)
     tokenizer, vocab_size, PAD_ID, EOS_ID, UNK_ID, MASK_ID, id_to_token = init_tokenizer(tokenizer_name)
     
     # If MASK_ID was UNK (-1), force assign one if space allows? 
@@ -257,21 +269,32 @@ function process_data_tokenizer_stream(texts, output_file::AbstractString, meta_
         s = normalize_text(doc)
         isempty(s) && continue
 
-        ids = encode_ids(tokenizer, s)
-        if isempty(ids)
-            continue
+        is_first_doc_token = true
+        
+        paragraphs = paragraph_eos ? split(s, r"\n+") : [s]
+        for paragraph in paragraphs
+            p_text = paragraph_eos ? String(strip(paragraph)) : String(paragraph)
+            isempty(p_text) && continue
+
+            ids = encode_ids(tokenizer, p_text)
+            if isempty(ids)
+                continue
+            end
+
+            # Append EOS
+            if ids[end] != EOS_ID
+                 push!(ids, EOS_ID)
+            end
+
+            doc_resets = falses(length(ids))
+            if is_first_doc_token
+                doc_resets[1] = true
+                is_first_doc_token = false
+            end
+
+            append!(all_tokens, ids)
+            append!(reset_flags, doc_resets)
         end
-
-        # Append EOS
-        if ids[end] != EOS_ID
-             push!(ids, EOS_ID)
-        end
-
-        doc_resets = falses(length(ids))
-        doc_resets[1] = true
-
-        append!(all_tokens, ids)
-        append!(reset_flags, doc_resets)
     end
 
     println("Total tokens: $(length(all_tokens))")
@@ -329,9 +352,9 @@ function process(cfg)
     meta_file = resolve_meta_file(output_file; meta_file=cfg.meta_file)
     
     if mode == "char"
-        process_data_char_stream(texts, output_file, meta_file, cfg.char_vocab_docs)
+        process_data_char_stream(texts, output_file, meta_file, cfg.char_vocab_docs, cfg.paragraph_eos)
     else
-        process_data_tokenizer_stream(texts, output_file, meta_file, cfg.tokenizer_name)
+        process_data_tokenizer_stream(texts, output_file, meta_file, cfg.tokenizer_name, cfg.paragraph_eos)
     end
     return
 end
@@ -345,6 +368,7 @@ function data_prep(args::Vector{String})
         println("  --tokenizer-name <str>    HuggingFace tokenizer name (or empty for char-level)")
         println("  --output-file <path>      Output .jld2 file path")
         println("  --max-docs <int>          Limit number of documents")
+        println("  --paragraph-eos <bool>    Inject EOS at paragraph boundaries (true/false, default: false)")
         return
     end
     cli = Utils.parse_cli_args(args)

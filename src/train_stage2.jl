@@ -162,9 +162,6 @@ function load_stage1(cfg, vocab_size::Int, pad_id::Int, eos_id::Int)
     st = ckpt["st"]
     dim = size(ps.encoder.embedding.weight, 1)
     vocab_ckpt = size(ps.encoder.embedding.weight, 2)
-    if vocab_ckpt != vocab_size
-        error("Vocab size mismatch: ckpt vocab_size=$(vocab_ckpt) but data vocab_size=$(vocab_size)")
-    end
     mamba_d_state = if haskey(ckpt, "mamba_d_state")
         Int(ckpt["mamba_d_state"])
     else
@@ -175,6 +172,40 @@ function load_stage1(cfg, vocab_size::Int, pad_id::Int, eos_id::Int)
     rng = Random.default_rng()
     Random.seed!(rng, 42)
     ps0, st0 = Lux.setup(rng, model)
+    
+    if vocab_ckpt != vocab_size
+        println("Warning: Vocab size mismatch! Resizing from $(vocab_ckpt) to $(vocab_size).")
+        n_copy = min(vocab_ckpt, vocab_size)
+        
+        # Resize encoder embedding
+        new_enc_embed = copy(ps0.encoder.embedding.weight)
+        new_enc_embed[:, 1:n_copy] .= ps.encoder.embedding.weight[:, 1:n_copy]
+        ps = merge(ps, (encoder=merge(ps.encoder, (embedding=(weight=new_enc_embed,),)),))
+        
+        # Resize decoder if exists
+        if haskey(ps, :decoder)
+            new_dec_embed = copy(ps0.decoder.embedding.weight)
+            if haskey(ps.decoder, :embedding)
+                new_dec_embed[:, 1:n_copy] .= ps.decoder.embedding.weight[:, 1:n_copy]
+            end
+            
+            new_dec_proj_w = copy(ps0.decoder.proj.weight)
+            new_dec_proj_b = copy(ps0.decoder.proj.bias)
+            if haskey(ps.decoder, :proj)
+                new_dec_proj_w[1:n_copy, :] .= ps.decoder.proj.weight[1:n_copy, :]
+                
+                # Bias could be [V, 1] or [V]
+                if length(size(ps.decoder.proj.bias)) >= 2
+                    new_dec_proj_b[1:n_copy, 1] .= ps.decoder.proj.bias[1:n_copy, 1]
+                else
+                    new_dec_proj_b[1:n_copy] .= ps.decoder.proj.bias[1:n_copy]
+                end
+            end
+            
+            ps = merge(ps, (decoder=merge(ps.decoder, (embedding=(weight=new_dec_embed,), proj=(weight=new_dec_proj_w, bias=new_dec_proj_b))),))
+        end
+    end
+    
     if !haskey(ps, :norm)
         ps = merge(ps, (norm=ps0.norm,))
     end
@@ -187,35 +218,59 @@ function load_stage1(cfg, vocab_size::Int, pad_id::Int, eos_id::Int)
     return model, ps, st, dim, mamba_d_state
 end
 
-function encode_capsules(model, ps, st, x_batch)
-    capsules_params, st_enc = model.encoder(x_batch, ps.encoder, st.encoder)
+function compute_loss(model1, mixer, reasoner, ps, st, x_batch, eos_id, K_dyn::Int, kl_weight::Float32)
+    # 1. Encode
+    capsules_params, st_enc = model1.encoder(x_batch, ps.encoder, st.encoder)
     mu, logvar = capsules_params
-    z = Model.reparameterize(mu, logvar; training=false)
-    z_norm, st_norm = model.norm(z, ps.norm, st.norm)
-    st_new = merge(st, (encoder=st_enc, norm=st_norm))
-    return z_norm, st_new
-end
+    Dim, Lcap, B = size(mu)
+    
+    # KL Divergence
+    kl_div = -0.5f0 * sum(1f0 .+ logvar .- abs2.(mu) .- exp.(logvar)) / max(Lcap * B, 1)
 
-function compute_loss(mixer, reasoner, ps2, st2, capsules)
-    x_k, st_mix = mixer(capsules, ps2.mixer, st2.mixer)
-    y, st_reas = reasoner(x_k, ps2.reasoner, st2.reasoner)
+    # 2. Initial Mixing
+    x_k_unnorm, st_mix = mixer(capsules_params, K_dyn, ps.mixer, st.mixer)
+
+    # 3. Normalization
+    x_k_flat = reshape(x_k_unnorm, Dim, :)
+    x_k_norm_flat, st_norm = model1.norm(x_k_flat, ps.norm, st.norm)
+    x_k = reshape(x_k_norm_flat, Dim, K_dyn, Lcap, B)
+
+    # 4. Reasoner
+    y, st_reas = reasoner(x_k, ps.reasoner, st.reasoner)
     y_mean = dropdims(mean(y; dims=2); dims=2)
-    Lcap = size(y_mean, 2)
+    
     if Lcap <= 1
         loss = zero(eltype(y_mean))
-        return loss, (mixer=st_mix, reasoner=st_reas), (; pred=loss, lcap=Lcap)
+        return loss, (encoder=st_enc, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=loss, kl=kl_div, lcap=Lcap)
     end
-    target = Zygote.dropgrad(@view capsules[:, 2:end, :])
+    
+    # 5. Target
+    mu_flat = reshape(mu, Dim, :)
+    mu_norm_flat, _ = model1.norm(mu_flat, ps.norm, st.norm)
+    mu_norm = reshape(mu_norm_flat, Dim, Lcap, B)
+    target = Zygote.dropgrad(@view mu_norm[:, 2:end, :])
     pred = @view y_mean[:, 1:end-1, :]
     
-    # Cosine Distance Loss to prevent Regression to the Mean
+    L = size(x_batch, 1)
+    stride = L ÷ Lcap
+    eos_mask_tokens = (x_batch .== eos_id)
+    eos_mask_4d = reshape(eos_mask_tokens, stride, Lcap, B)
+    capsule_has_eos = dropdims(any(eos_mask_4d; dims=1); dims=1)
+    valid_transition = .!(capsule_has_eos[1:end-1, :])
+
     pred_normsq = sum(abs2, pred; dims=1) .+ Float32(1e-6)
     target_normsq = sum(abs2, target; dims=1) .+ Float32(1e-6)
     dot_product = sum(pred .* target; dims=1)
     cos_sim = dot_product ./ sqrt.(pred_normsq .* target_normsq)
-    loss = mean(Float32(1.0) .- cos_sim)
     
-    return loss, (mixer=st_mix, reasoner=st_reas), (; pred=loss, lcap=Lcap)
+    per_transition_loss = Float32(1.0) .- cos_sim
+    masked_loss = per_transition_loss .* reshape(valid_transition, 1, Lcap-1, B)
+    num_valid = sum(valid_transition)
+    
+    pred_loss = sum(masked_loss) / max(num_valid, 1)
+    loss = pred_loss + kl_weight * kl_div
+    
+    return loss, (encoder=st_enc, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=pred_loss, kl=kl_div, lcap=Lcap)
 end
 
 function train(cfg)
@@ -251,8 +306,8 @@ function train(cfg)
     reasoner = MHCLatentReasoner(dim, cfg.k_streams, cfg.heads, cfg.num_layers; k_drop_threshold=Float32(cfg.k_drop_threshold), k_drop_min=cfg.k_drop_min)
     ps_mix, st_mix = Lux.setup(rng, mixer)
     ps_reas, st_reas = Lux.setup(rng, reasoner)
-    ps2 = (; mixer=ps_mix, reasoner=ps_reas)
-    st2 = (; mixer=st_mix, reasoner=st_reas)
+    ps2 = (; encoder=ps1.encoder, norm=ps1.norm, mixer=ps_mix, reasoner=ps_reas)
+    st2 = (; encoder=st1.encoder, norm=st1.norm, mixer=st_mix, reasoner=st_reas)
 
     resume_opt_state = nothing
     train_step = 0
@@ -342,16 +397,14 @@ function train(cfg)
             current_lr = TrainStage1.get_lr(train_step + 1, warmup_steps, target_lr, total_steps)
             Optimisers.adjust!(opt_state, current_lr)
 
-            TrainStage1.apply_reset!(st1, reset_mask)
             TrainStage1.apply_reset!(st2, reset_mask)
 
             x_batch = x_cpu_raw |> dev
-            capsules_norm, st1_new = encode_capsules(model1, ps1, st1, x_batch)
-            st1 = st1_new
-            capsules_norm = Zygote.dropgrad(capsules_norm)
-
+            K_dyn = rand(1:cfg.k_streams)
+            kl_weight = Float32(parse(Float64, get(ENV, "KL_WEIGHT", "0.01")))
+            
             (loss, st2_new, internals), back = Zygote.pullback(
-                p -> compute_loss(mixer, reasoner, p, st2, capsules_norm), ps2
+                p -> compute_loss(model1, mixer, reasoner, p, st2, x_batch, eos_id, K_dyn, kl_weight), ps2
             )
 
             loss_val = Float32(loss)
@@ -382,7 +435,7 @@ function train(cfg)
             train_step += 1
 
             if i % 50 == 0
-                @printf "Epoch %d [%d/%d] Loss: %.4f | Pred: %.4f | Lcap: %d | |g|: %.4f | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.pred internals.lcap grad_norm current_lr
+                @printf "Epoch %d [%d/%d] Loss: %.4f | Pred: %.4f | KL: %.4f | Lcap: %d | |g|: %.4f | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.pred internals.kl internals.lcap grad_norm current_lr
             end
 
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
