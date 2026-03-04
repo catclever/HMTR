@@ -173,6 +173,36 @@ function load_stage1(cfg, vocab_size::Int, pad_id::Int, eos_id::Int)
     Random.seed!(rng, 42)
     ps0, st0 = Lux.setup(rng, model)
     
+    if haskey(ps.encoder, :head)
+        # Legacy checkpoint transition
+        old_head_w = ps.encoder.head.weight
+        old_head_b = ps.encoder.head.bias
+        mu_w = old_head_w[1:dim, :]
+        var_w = old_head_w[dim+1:end, :]
+        mu_b = old_head_b[1:dim]
+        var_b = old_head_b[dim+1:end]
+        
+        encoder_new = merge(ps.encoder, (
+            mu_head=(weight=mu_w, bias=mu_b),
+            var_head=(weight=var_w, bias=var_b)
+        ))
+        
+        # Remove the old :head from NamedTuple
+        keys_keep = filter(k -> k != :head, keys(encoder_new))
+        encoder_clean = NamedTuple{keys_keep}(Tuple(encoder_new[k] for k in keys_keep))
+        
+        ps = merge(ps, (encoder=encoder_clean,))
+        
+        # Also clean state
+        st_enc_new = merge(st.encoder, (
+            mu_head=NamedTuple(),
+            var_head=NamedTuple()
+        ))
+        keys_keep_st = filter(k -> k != :head, keys(st_enc_new))
+        st_enc_clean = NamedTuple{keys_keep_st}(Tuple(st_enc_new[k] for k in keys_keep_st))
+        st = merge(st, (encoder=st_enc_clean,))
+    end
+
     if vocab_ckpt != vocab_size
         println("Warning: Vocab size mismatch! Resizing from $(vocab_ckpt) to $(vocab_size).")
         n_copy = min(vocab_ckpt, vocab_size)
@@ -218,35 +248,41 @@ function load_stage1(cfg, vocab_size::Int, pad_id::Int, eos_id::Int)
     return model, ps, st, dim, mamba_d_state
 end
 
-function compute_loss(model1, mixer, reasoner, ps, st, x_batch, eos_id, K_dyn::Int, kl_weight::Float32)
+function compute_loss(model1, mixer, reasoner, ps_train, st, x_batch, eos_id, K_dyn::Int, kl_weight::Float32)
+    # Reconstruct parameter tree for full Mamba encode (Zygote friendly)
+    encoder_ps = (embedding=st.frozen_ps.embedding, layers=st.frozen_ps.layers, mu_head=st.frozen_ps.mu_head, var_head=ps_train.var_head)
+    encoder_st = (embedding=st.encoder.embedding, layers=st.encoder.layers, mu_head=st.encoder.mu_head, var_head=st.var_head)
+
     # 1. Encode
-    capsules_params, st_enc = model1.encoder(x_batch, ps.encoder, st.encoder)
+    capsules_params, st_enc = model1.encoder(x_batch, encoder_ps, encoder_st)
     mu, logvar = capsules_params
+    mu = Zygote.dropgrad(mu) # Manifold Preservation Requirement
+    
     Dim, Lcap, B = size(mu)
     
     # KL Divergence
     kl_div = -0.5f0 * sum(1f0 .+ logvar .- abs2.(mu) .- exp.(logvar)) / max(Lcap * B, 1)
 
     # 2. Initial Mixing
-    x_k_unnorm, st_mix = mixer(capsules_params, K_dyn, ps.mixer, st.mixer)
+    x_k_unnorm, st_mix = mixer(capsules_params, K_dyn, ps_train.mixer, st.mixer)
 
     # 3. Normalization
     x_k_flat = reshape(x_k_unnorm, Dim, :)
-    x_k_norm_flat, st_norm = model1.norm(x_k_flat, ps.norm, st.norm)
+    x_k_norm_flat, st_norm = model1.norm(x_k_flat, ps_train.norm, st.norm)
     x_k = reshape(x_k_norm_flat, Dim, K_dyn, Lcap, B)
 
     # 4. Reasoner
-    y, st_reas = reasoner(x_k, ps.reasoner, st.reasoner)
+    y, st_reas = reasoner(x_k, ps_train.reasoner, st.reasoner)
     y_mean = dropdims(mean(y; dims=2); dims=2)
     
     if Lcap <= 1
         loss = zero(eltype(y_mean))
-        return loss, (encoder=st_enc, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=loss, kl=kl_div, lcap=Lcap)
+        return loss, (var_head=st_enc.var_head, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=loss, kl=kl_div, lcap=Lcap)
     end
     
     # 5. Target
     mu_flat = reshape(mu, Dim, :)
-    mu_norm_flat, _ = model1.norm(mu_flat, ps.norm, st.norm)
+    mu_norm_flat, _ = model1.norm(mu_flat, ps_train.norm, st.norm)
     mu_norm = reshape(mu_norm_flat, Dim, Lcap, B)
     target = Zygote.dropgrad(@view mu_norm[:, 2:end, :])
     pred = @view y_mean[:, 1:end-1, :]
@@ -270,7 +306,7 @@ function compute_loss(model1, mixer, reasoner, ps, st, x_batch, eos_id, K_dyn::I
     pred_loss = sum(masked_loss) / max(num_valid, 1)
     loss = pred_loss + kl_weight * kl_div
     
-    return loss, (encoder=st_enc, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=pred_loss, kl=kl_div, lcap=Lcap)
+    return loss, (var_head=st_enc.var_head, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=pred_loss, kl=kl_div, lcap=Lcap)
 end
 
 function train(cfg)
@@ -306,8 +342,10 @@ function train(cfg)
     reasoner = MHCLatentReasoner(dim, cfg.k_streams, cfg.heads, cfg.num_layers; k_drop_threshold=Float32(cfg.k_drop_threshold), k_drop_min=cfg.k_drop_min)
     ps_mix, st_mix = Lux.setup(rng, mixer)
     ps_reas, st_reas = Lux.setup(rng, reasoner)
-    ps2 = (; encoder=ps1.encoder, norm=ps1.norm, mixer=ps_mix, reasoner=ps_reas)
-    st2 = (; encoder=st1.encoder, norm=st1.norm, mixer=st_mix, reasoner=st_reas)
+    
+    # Isolate var_head for Stage 2 optimization
+    ps_train = (; var_head=ps1.encoder.var_head, norm=ps1.norm, mixer=ps_mix, reasoner=ps_reas)
+    st_train = (; var_head=st1.encoder.var_head, norm=st1.norm, mixer=st_mix, reasoner=st_reas, frozen_ps=(embedding=ps1.encoder.embedding, layers=ps1.encoder.layers, mu_head=ps1.encoder.mu_head), encoder=st1.encoder)
 
     resume_opt_state = nothing
     train_step = 0
@@ -316,8 +354,8 @@ function train(cfg)
             error("resume_ckpt=$(cfg.resume_ckpt) not found")
         end
         ckpt = JLD2.load(cfg.resume_ckpt)
-        ps2 = ckpt["ps"]
-        st2 = ckpt["st"]
+        ps_train = ckpt["ps"]
+        st_train = ckpt["st"]
         if haskey(ckpt, "opt_state")
             resume_opt_state = ckpt["opt_state"]
         end
@@ -327,11 +365,11 @@ function train(cfg)
         println("Resuming from ckpt=$(cfg.resume_ckpt) train_step=$(train_step)")
     end
 
-    ps2 = ps2 |> dev
-    st2 = st2 |> dev
+    ps_train = ps_train |> dev
+    st_train = st_train |> dev
 
     opt = Optimisers.Adam(cfg.lr)
-    opt_state = Optimisers.setup(opt, ps2)
+    opt_state = Optimisers.setup(opt, ps_train)
     if resume_opt_state !== nothing
         opt_state = resume_opt_state |> dev
     end
@@ -397,14 +435,14 @@ function train(cfg)
             current_lr = TrainStage1.get_lr(train_step + 1, warmup_steps, target_lr, total_steps)
             Optimisers.adjust!(opt_state, current_lr)
 
-            TrainStage1.apply_reset!(st2, reset_mask)
+            TrainStage1.apply_reset!(st_train, reset_mask)
 
             x_batch = x_cpu_raw |> dev
             K_dyn = rand(1:cfg.k_streams)
             kl_weight = Float32(parse(Float64, get(ENV, "KL_WEIGHT", "0.01")))
             
-            (loss, st2_new, internals), back = Zygote.pullback(
-                p -> compute_loss(model1, mixer, reasoner, p, st2, x_batch, eos_id, K_dyn, kl_weight), ps2
+            (loss, st_new, internals), back = Zygote.pullback(
+                p -> compute_loss(model1, mixer, reasoner, p, st_train, x_batch, eos_id, K_dyn, kl_weight), ps_train
             )
 
             loss_val = Float32(loss)
@@ -415,7 +453,7 @@ function train(cfg)
                 eos_frac = stats.n_eos / max(stats.n_total, 1)
                 @printf "SPIKE Epoch %d Step %d Loss %.4f | x[min=%d max=%d] pad=%.3f eos=%.3f\n" epoch i loss_val stats.x_min stats.x_max pad_frac eos_frac
                 if !isfinite(loss_val)
-                    st2 = st2_new
+                    st_train = st_new
                 end
                 if cfg.skip_on_spike
                     continue
@@ -428,8 +466,8 @@ function train(cfg)
                 @printf "GradClip Epoch %d Step %d | norm=%.4f scale=%.6f\n" epoch i grad_norm grad_scale
             end
 
-            opt_state, ps2 = Optimisers.update(opt_state, ps2, grads)
-            st2 = st2_new
+            opt_state, ps_train = Optimisers.update(opt_state, ps_train, grads)
+            st_train = merge(st_train, (var_head=st_new.var_head, norm=st_new.norm, mixer=st_new.mixer, reasoner=st_new.reasoner))
             total_loss += loss_val
             n_updates += 1
             train_step += 1
@@ -441,8 +479,8 @@ function train(cfg)
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
                 jldsave(
                     joinpath(cfg.checkpoint_dir, "$(cfg.checkpoint_prefix)_epoch$(epoch)_step$(i).jld2");
-                    ps=ps2 |> cpu,
-                    st=st2 |> cpu,
+                    ps=ps_train |> cpu,
+                    st=st_train |> cpu,
                     opt_state=opt_state |> cpu,
                     epoch=epoch,
                     step=i,

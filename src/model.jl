@@ -317,10 +317,11 @@ end
 
 # --- 1. Mamba Encoder ---
 
-struct MambaCompressor{L<:Lux.AbstractLuxLayer, H<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
+struct MambaCompressor{L<:Lux.AbstractLuxLayer, H1<:Lux.AbstractLuxLayer, H2<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
     embedding::Lux.Embedding
     layers::L
-    head::H
+    mu_head::H1
+    var_head::H2
     block_size::Int
     dim::Int
     pad_id::Int
@@ -335,21 +336,24 @@ function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::I
         SimplifiedMambaBlock(dim, mamba_d_state),
         SimplifiedMambaBlock(dim, mamba_d_state)
     )
-    # VAE Head: Project to 2 * dim (mu, logvar)
-    head = Dense(dim => dim * 2)
-    return MambaCompressor(Embedding(vocab_size => dim), layers, head, block_size, dim, pad_id, eos_id)
+    # VAE Heads: Separate projections for mu and logvar
+    mu_head = Dense(dim => dim)
+    var_head = Dense(dim => dim)
+    return MambaCompressor(Embedding(vocab_size => dim), layers, mu_head, var_head, block_size, dim, pad_id, eos_id)
 end
 
 Lux.initialparameters(rng::AbstractRNG, m::MambaCompressor) = (
     embedding=Lux.initialparameters(rng, m.embedding),
     layers=Lux.initialparameters(rng, m.layers),
-    head=Lux.initialparameters(rng, m.head)
+    mu_head=Lux.initialparameters(rng, m.mu_head),
+    var_head=Lux.initialparameters(rng, m.var_head)
 )
 
 Lux.initialstates(rng::AbstractRNG, m::MambaCompressor) = (
     embedding=Lux.initialstates(rng, m.embedding),
     layers=Lux.initialstates(rng, m.layers),
-    head=Lux.initialstates(rng, m.head)
+    mu_head=Lux.initialstates(rng, m.mu_head),
+    var_head=Lux.initialstates(rng, m.var_head)
 )
 
 function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
@@ -400,18 +404,14 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     
     # Project to VAE params
     # pooled_flat: [Dim, Lcap * B]
-    vae_out_flat, st_head = m.head(pooled_flat, ps.head, st.head)
-    # vae_out_flat: [2*Dim, Lcap * B]
+    mu_flat, st_mu = m.mu_head(pooled_flat, ps.mu_head, st.mu_head)
+    var_flat, st_var = m.var_head(pooled_flat, ps.var_head, st.var_head)
     
-    # Reshape back to [2*Dim, Lcap, B]
-    vae_out = reshape(vae_out_flat, :, s[2], s[3])
-    
-    # Split into mu and logvar
-    # We assume dim 1 is 2*Dim
-    mu = @view vae_out[1:m.dim, :, :]
-    logvar = @view vae_out[m.dim+1:end, :, :]
+    # Reshape back to [Dim, Lcap, B]
+    mu = reshape(mu_flat, m.dim, s[2], s[3])
+    logvar = reshape(var_flat, m.dim, s[2], s[3])
 
-    return (mu, logvar), (embedding=st_emb, layers=st_layers, head=st_head)
+    return (mu, logvar), (embedding=st_emb, layers=st_layers, mu_head=st_mu, var_head=st_var)
 end
 # --- 3. Transformer Reasoner (MHC Stage 2) ---
 
