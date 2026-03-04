@@ -780,13 +780,53 @@ function train(cfg)
             error("resume_ckpt=$(cfg.resume_ckpt) not found")
         end
         ckpt = JLD2.load(cfg.resume_ckpt)
-        ps = ckpt["ps"]
+        ps_ckpt = ckpt["ps"]
         st = ckpt["st"]
         if haskey(ckpt, "opt_state")
             resume_opt_state = ckpt["opt_state"]
         end
         if haskey(ckpt, "train_step")
             train_step = Int(ckpt["train_step"])
+        end
+
+        # Handle Vocabulary Expansion / Resizing
+        vocab_ckpt = size(ps_ckpt.encoder.embedding.weight, 2)
+        if vocab_ckpt != vocab_size
+            println("Warning: Vocab size mismatch in resumed checkpoint! Resizing from $(vocab_ckpt) to $(vocab_size).")
+            n_copy = min(vocab_ckpt, vocab_size)
+            
+            # 1. Resize encoder embedding
+            new_enc_embed = copy(ps0.encoder.embedding.weight)
+            new_enc_embed[:, 1:n_copy] .= ps_ckpt.encoder.embedding.weight[:, 1:n_copy]
+            ps_enc_new = merge(ps_ckpt.encoder, (embedding=(weight=new_enc_embed,),))
+            ps_new = merge(ps_ckpt, (encoder=ps_enc_new,))
+            
+            # 2. Resize decoder if exists
+            if haskey(ps_ckpt, :decoder)
+                new_dec_embed = copy(ps0.decoder.embedding.weight)
+                if haskey(ps_ckpt.decoder, :embedding)
+                    new_dec_embed[:, 1:n_copy] .= ps_ckpt.decoder.embedding.weight[:, 1:n_copy]
+                end
+                
+                new_dec_proj_w = copy(ps0.decoder.proj.weight)
+                new_dec_proj_b = copy(ps0.decoder.proj.bias)
+                if haskey(ps_ckpt.decoder, :proj)
+                    new_dec_proj_w[1:n_copy, :] .= ps_ckpt.decoder.proj.weight[1:n_copy, :]
+                    
+                    if length(size(ps_ckpt.decoder.proj.bias)) >= 2
+                        new_dec_proj_b[1:n_copy, 1] .= ps_ckpt.decoder.proj.bias[1:n_copy, 1]
+                    else
+                        new_dec_proj_b[1:n_copy] .= ps_ckpt.decoder.proj.bias[1:n_copy]
+                    end
+                end
+                
+                ps_dec_new = merge(ps_ckpt.decoder, (embedding=(weight=new_dec_embed,), proj=(weight=new_dec_proj_w, bias=new_dec_proj_b)))
+                ps = merge(ps_new, (decoder=ps_dec_new,))
+            else
+                ps = ps_new
+            end
+        else
+            ps = ps_ckpt
         end
 
         if !haskey(ps, :norm)

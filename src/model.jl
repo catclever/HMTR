@@ -384,10 +384,52 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
     seq_len = Lpad
     Lcap = Lpad ÷ stride
 
-    # hidden is already padded
+    # x_pad is [Lpad, B]
+    x_pad_blocks = reshape(x_pad, stride, Lcap, B)
+    
+    # hidden is already padded [Dim, Lpad, B]
     hidden4 = reshape(hidden, size(hidden, 1), stride, Lcap, B)
-    # Always pool at `stride` since sequence is padded to full blocks
-    pooled_slices = ntuple(c -> reshape(@view(hidden4[:, stride, c, :]), size(hidden4, 1), 1, B), Lcap)
+    
+    # Find the pooling index for each block and batch
+    # We want the index of the last valid token (before the first PAD)
+    # If no PAD, it's `stride`. If the first token is PAD, we take index 1 as fallback.
+    valid_lengths = Zygote.@ignore map(CartesianIndices((Lcap, B))) do idx
+        c = idx[1]
+        b = idx[2]
+        block_tokens = @view x_pad_blocks[:, c, b]
+        pad_idx = findfirst(==(m.pad_id), block_tokens)
+        if pad_idx === nothing
+            stride
+        else
+            max(1, pad_idx - 1)
+        end
+    end
+
+    # Gather the specific hidden state for each block based on valid_lengths
+    Dim = size(hidden4, 1)
+    
+    # We use list comprehension over capsules to keep Zygote happy with indexing
+    pooled_slices = ntuple(Lcap) do c
+        # For capsule c, gather across the batch dimension
+        # hidden4[:, :, c, :] -> [Dim, stride, B]
+        h_c = @view hidden4[:, :, c, :]
+        lens = @view valid_lengths[c, :]
+        
+        # We need to extract an array of size [Dim, 1, B]
+        # In pure Zygote, dynamic array indexing over batch can be tricky.
+        # We can construct a one-hot mask for the temporal dimension.
+        mask_cpu = zeros(Float32, stride, B)
+        for b in 1:B
+            mask_cpu[lens[b], b] = 1.0f0
+        end
+        mask = h_c isa CUDA.AbstractGPUArray ? CUDA.CuArray(mask_cpu) : mask_cpu
+        mask = Zygote.dropgrad(reshape(mask, 1, stride, B))
+        
+        # Multiply and sum over the stride dimension
+        # sum([Dim, stride, B] .* [1, stride, B], dims=2) -> [Dim, 1, B]
+        sum(h_c .* mask; dims=2)
+    end
+    
     pooled = cat(pooled_slices...; dims=2)
     
     # helper for view preservation and batching
