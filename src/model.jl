@@ -644,7 +644,11 @@ function (l::InitialMixingLayer)(capsules::Tuple, K_dyn::Int, ps, st)
     # 3. Apply variance noise (Reparameterization trick)
     # epsilon: [Dim, K_dyn, L, B]
     epsilon_cpu = randn(Float32, Dim, K_dyn, L, B)
-    epsilon = mu isa CUDA.AbstractGPUArray ? CUDA.CuArray(epsilon_cpu) : epsilon_cpu
+    mu_parent = mu
+    while mu_parent isa SubArray || mu_parent isa Base.ReshapedArray
+        mu_parent = parent(mu_parent)
+    end
+    epsilon = mu_parent isa CUDA.AbstractGPUArray ? CUDA.CuArray(epsilon_cpu) : epsilon_cpu
     epsilon = Zygote.dropgrad(epsilon)
     
     # logvar is [Dim, 1, L, B] (Needs reshape for broadcast)
