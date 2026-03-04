@@ -248,7 +248,7 @@ function load_stage1(cfg, vocab_size::Int, pad_id::Int, eos_id::Int)
     return model, ps, st, dim, mamba_d_state
 end
 
-function compute_loss(model1, mixer, reasoner, ps_train, st, x_batch, eos_id, K_dyn::Int, kl_weight::Float32)
+function compute_loss(model1, mixer, reasoner, ps_train, st, x_batch, eos_id, pad_id, K_dyn::Int, kl_weight::Float32, recon_weight::Float32)
     # Reconstruct parameter tree for full Mamba encode (Zygote friendly)
     encoder_ps = (embedding=st.frozen_ps.embedding, layers=st.frozen_ps.layers, mu_head=st.frozen_ps.mu_head, var_head=ps_train.var_head)
     encoder_st = (embedding=st.encoder.embedding, layers=st.encoder.layers, mu_head=st.encoder.mu_head, var_head=st.var_head)
@@ -263,6 +263,37 @@ function compute_loss(model1, mixer, reasoner, ps_train, st, x_batch, eos_id, K_
     # KL Divergence
     kl_div = -0.5f0 * sum(1f0 .+ logvar .- abs2.(mu) .- exp.(logvar)) / max(Lcap * B, 1)
 
+    rng = Random.default_rng()
+    z = Model.reparameterize(mu, logvar; rng=rng, training=true)
+    capsules_norm, _st_norm_caps = model1.norm(z, ps_train.norm, st.norm)
+    logits, _st_dec = model1.decoder(capsules_norm, x_batch, st.frozen_dec, st.decoder; start_id=eos_id, teacher_forcing=true)
+    vocab_size = size(logits, 1)
+    L = size(x_batch, 1)
+    K = max(getfield(model1.decoder, :block_size), 1)
+    Lpad = K * cld(L, K)
+    y_pred_pad = if Lpad == L
+        logits
+    else
+        pad_part = similar(logits, vocab_size, Lpad - L, B)
+        Zygote.@ignore fill!(pad_part, zero(eltype(pad_part)))
+        cat(logits, pad_part; dims=2)
+    end
+    y_batch_pad = if Lpad == L
+        x_batch
+    else
+        pad_part = similar(x_batch, Lpad - L, B)
+        Zygote.@ignore fill!(pad_part, pad_id)
+        cat(x_batch, pad_part; dims=1)
+    end
+    y_pred_flat = reshape(y_pred_pad, vocab_size, :)
+    y_batch_flat = reshape(y_batch_pad, :)
+    logits_flat = eltype(y_pred_flat) <: Union{Float16,Core.BFloat16} ? Float32.(y_pred_flat) : y_pred_flat
+    log_probs = TrainStage1.logsoftmax_stable(logits_flat; dims=1)
+    mask = y_batch_flat .!= pad_id
+    weights = Float32.(mask)
+    picked = TrainStage1.gather2d(log_probs, y_batch_flat)
+    recon_loss = sum((-picked) .* weights) / max(sum(weights), 1)
+
     # 2. Initial Mixing
     x_k_unnorm, st_mix = mixer(capsules_params, K_dyn, ps_train.mixer, st.mixer)
 
@@ -276,8 +307,9 @@ function compute_loss(model1, mixer, reasoner, ps_train, st, x_batch, eos_id, K_
     y_mean = dropdims(mean(y; dims=2); dims=2)
     
     if Lcap <= 1
-        loss = zero(eltype(y_mean))
-        return loss, (var_head=st_enc.var_head, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=loss, kl=kl_div, lcap=Lcap)
+        pred_loss = zero(eltype(y_mean))
+        loss = pred_loss + kl_weight * kl_div + recon_weight * recon_loss
+        return loss, (var_head=st_enc.var_head, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=pred_loss, kl=kl_div, recon=recon_loss, lcap=Lcap)
     end
     
     # 5. Target
@@ -304,9 +336,9 @@ function compute_loss(model1, mixer, reasoner, ps_train, st, x_batch, eos_id, K_
     num_valid = sum(valid_transition)
     
     pred_loss = sum(masked_loss) / max(num_valid, 1)
-    loss = pred_loss + kl_weight * kl_div
+    loss = pred_loss + kl_weight * kl_div + recon_weight * recon_loss
     
-    return loss, (var_head=st_enc.var_head, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=pred_loss, kl=kl_div, lcap=Lcap)
+    return loss, (var_head=st_enc.var_head, norm=st_norm, mixer=st_mix, reasoner=st_reas), (; pred=pred_loss, kl=kl_div, recon=recon_loss, lcap=Lcap)
 end
 
 function train(cfg)
@@ -345,7 +377,7 @@ function train(cfg)
     
     # Isolate var_head for Stage 2 optimization
     ps_train = (; var_head=ps1.encoder.var_head, norm=ps1.norm, mixer=ps_mix, reasoner=ps_reas)
-    st_train = (; var_head=st1.encoder.var_head, norm=st1.norm, mixer=st_mix, reasoner=st_reas, frozen_ps=(embedding=ps1.encoder.embedding, layers=ps1.encoder.layers, mu_head=ps1.encoder.mu_head), encoder=st1.encoder)
+    st_train = (; var_head=st1.encoder.var_head, norm=st1.norm, mixer=st_mix, reasoner=st_reas, frozen_ps=(embedding=ps1.encoder.embedding, layers=ps1.encoder.layers, mu_head=ps1.encoder.mu_head), frozen_dec=ps1.decoder, encoder=st1.encoder, decoder=st1.decoder)
 
     resume_opt_state = nothing
     train_step = 0
@@ -363,6 +395,9 @@ function train(cfg)
             train_step = Int(ckpt["train_step"])
         end
         println("Resuming from ckpt=$(cfg.resume_ckpt) train_step=$(train_step)")
+    end
+    if !haskey(st_train, :frozen_dec)
+        st_train = merge(st_train, (frozen_dec=ps1.decoder, decoder=st1.decoder))
     end
 
     ps_train = ps_train |> dev
@@ -440,9 +475,10 @@ function train(cfg)
             x_batch = x_cpu_raw |> dev
             K_dyn = rand(1:cfg.k_streams)
             kl_weight = Float32(parse(Float64, get(ENV, "KL_WEIGHT", "0.01")))
+            recon_weight = Float32(parse(Float64, get(ENV, "RECON_WEIGHT", "1.0")))
             
             (loss, st_new, internals), back = Zygote.pullback(
-                p -> compute_loss(model1, mixer, reasoner, p, st_train, x_batch, eos_id, K_dyn, kl_weight), ps_train
+                p -> compute_loss(model1, mixer, reasoner, p, st_train, x_batch, eos_id, pad_id, K_dyn, kl_weight, recon_weight), ps_train
             )
 
             loss_val = Float32(loss)
@@ -473,7 +509,7 @@ function train(cfg)
             train_step += 1
 
             if i % 50 == 0
-                @printf "Epoch %d [%d/%d] Loss: %.4f | Pred: %.4f | KL: %.4f | Lcap: %d | |g|: %.4f | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.pred internals.kl internals.lcap grad_norm current_lr
+                @printf "Epoch %d [%d/%d] Loss: %.4f | Pred: %.4f | KL: %.4f | Recon: %.4f | Lcap: %d | |g|: %.4f | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.pred internals.kl internals.recon internals.lcap grad_norm current_lr
             end
 
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
@@ -502,8 +538,8 @@ function train(cfg)
 
         jldsave(
             joinpath(cfg.checkpoint_dir, "$(cfg.checkpoint_prefix)_epoch$epoch.jld2");
-            ps=ps2 |> cpu,
-            st=st2 |> cpu,
+            ps=ps_train |> cpu,
+            st=st_train |> cpu,
             opt_state=opt_state |> cpu,
             epoch=epoch,
             step=0,

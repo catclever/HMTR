@@ -481,6 +481,19 @@ function infer(cfg)
 
     dim = size(ps.encoder.embedding.weight, 1)
     vocab_size = size(ps.encoder.embedding.weight, 2)
+    if haskey(ps.encoder, :head) && (!haskey(ps.encoder, :mu_head) || !haskey(ps.encoder, :var_head))
+        stage1_head = ps.encoder.head
+        mu_w = stage1_head.weight[1:dim, :]
+        var_w = stage1_head.weight[dim+1:end, :]
+        mu_b = stage1_head.bias[1:dim]
+        var_b = stage1_head.bias[dim+1:end]
+        encoder_full = (embedding=ps.encoder.embedding, layers=ps.encoder.layers, mu_head=(weight=mu_w, bias=mu_b), var_head=(weight=var_w, bias=var_b))
+        ps = merge(ps, (encoder=encoder_full,))
+    end
+    if haskey(st.encoder, :head) && (!haskey(st.encoder, :mu_head) || !haskey(st.encoder, :var_head))
+        encoder_st = (embedding=st.encoder.embedding, layers=st.encoder.layers, mu_head=st.encoder.head, var_head=st.encoder.head)
+        st = merge(st, (encoder=encoder_st,))
+    end
     if vocab_size != meta.vocab_size
         error("Vocab size mismatch: ckpt vocab_size=$(vocab_size) but data meta vocab_size=$(meta.vocab_size)")
     end
@@ -605,17 +618,41 @@ function infer_stage2(args::Vector{String})
     ps2 = ckpt["ps"]
     st2 = ckpt["st"]
 
-    dim = size(ps2.encoder.embedding.weight, 1)
-    vocab_size = size(ps2.encoder.embedding.weight, 2)
-    if vocab_size != meta.vocab_size
-        error("Vocab size mismatch: stage2 vocab_size=$(vocab_size) but data meta vocab_size=$(meta.vocab_size)")
-    end
-
     stage1_ckpt = cfg.stage1_ckpt
     if isempty(stage1_ckpt) && haskey(ckpt, "stage1_ckpt")
         stage1_ckpt = string(ckpt["stage1_ckpt"])
     end
     decoder_model, ps_dec, st_dec = load_stage1_decoder(meta, stage1_ckpt)
+
+    ps2_full = ps2
+    st2_full = st2
+    if !haskey(ps2, :encoder)
+        stage1_enc = ps_dec.encoder
+        encoder_full = if haskey(stage1_enc, :mu_head) && haskey(stage1_enc, :var_head)
+            (embedding=stage1_enc.embedding, layers=stage1_enc.layers, mu_head=stage1_enc.mu_head, var_head=ps2.var_head)
+        else
+            stage1_head = stage1_enc.head
+            dim_stage1 = size(stage1_enc.embedding.weight, 1)
+            mu_w = stage1_head.weight[1:dim_stage1, :]
+            var_w = stage1_head.weight[dim_stage1+1:end, :]
+            mu_b = stage1_head.bias[1:dim_stage1]
+            var_b = stage1_head.bias[dim_stage1+1:end]
+            (embedding=stage1_enc.embedding, layers=stage1_enc.layers, mu_head=(weight=mu_w, bias=mu_b), var_head=(weight=var_w, bias=var_b))
+        end
+        ps2_full = merge(ps2, (encoder=encoder_full, norm=ps2.norm))
+    end
+    if !haskey(st2_full, :encoder)
+        st2_full = merge(st2_full, (encoder=st_dec.encoder,))
+    end
+    if !haskey(st2_full, :norm)
+        st2_full = merge(st2_full, (norm=st_dec.norm,))
+    end
+
+    dim = size(ps2_full.encoder.embedding.weight, 1)
+    vocab_size = size(ps2_full.encoder.embedding.weight, 2)
+    if vocab_size != meta.vocab_size
+        error("Vocab size mismatch: stage2 vocab_size=$(vocab_size) but data meta vocab_size=$(meta.vocab_size)")
+    end
 
     heads = haskey(ckpt, "heads") ? Int(ckpt["heads"]) : 8
     num_layers = haskey(ckpt, "num_layers") ? Int(ckpt["num_layers"]) : 4
@@ -657,12 +694,12 @@ function infer_stage2(args::Vector{String})
             if isempty(s) || s == ":q" || s == "quit" || s == "exit"
                 break
             end
-            infer_stage2_once(s, meta, ps2, st2, decoder_model, ps_dec, st_dec, mixer, reasoner, k_streams, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
+            infer_stage2_once(s, meta, ps2_full, st2_full, decoder_model, ps_dec, st_dec, mixer, reasoner, k_streams, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
         end
         return
     end
 
-    infer_stage2_once(cfg.text, meta, ps2, st2, decoder_model, ps_dec, st_dec, mixer, reasoner, k_streams, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
+    infer_stage2_once(cfg.text, meta, ps2_full, st2_full, decoder_model, ps_dec, st_dec, mixer, reasoner, k_streams, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
     return
 end
 
