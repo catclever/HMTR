@@ -418,10 +418,8 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
         # We need to extract an array of size [Dim, 1, B]
         # In pure Zygote, dynamic array indexing over batch can be tricky.
         # We can construct a one-hot mask for the temporal dimension.
-        mask_cpu = zeros(Float32, stride, B)
-        for b in 1:B
-            mask_cpu[lens[b], b] = 1.0f0
-        end
+        idxs = reshape(collect(1:stride), stride, 1)
+        mask_cpu = Float32.(idxs .== reshape(lens, 1, B))
         h_parent = h_c
         while h_parent isa SubArray || h_parent isa Base.ReshapedArray
             h_parent = parent(h_parent)
