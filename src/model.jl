@@ -422,7 +422,11 @@ function (m::MambaCompressor)(x::AbstractMatrix{Int}, ps, st)
         for b in 1:B
             mask_cpu[lens[b], b] = 1.0f0
         end
-        mask = h_c isa CUDA.AbstractGPUArray ? CUDA.CuArray(mask_cpu) : mask_cpu
+        h_parent = h_c
+        while h_parent isa SubArray || h_parent isa Base.ReshapedArray
+            h_parent = parent(h_parent)
+        end
+        mask = h_parent isa CUDA.AbstractGPUArray ? CUDA.CuArray(mask_cpu) : mask_cpu
         mask = Zygote.dropgrad(reshape(mask, 1, stride, B))
         
         # Multiply and sum over the stride dimension
