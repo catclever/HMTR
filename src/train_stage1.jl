@@ -789,10 +789,11 @@ function train(cfg)
             train_step = Int(ckpt["train_step"])
         end
 
-        # Handle Vocabulary Expansion / Resizing using character-aligned merge
+        vocab_resized = false
         vocab_ckpt = size(ps_ckpt.encoder.embedding.weight, 2)
         if vocab_ckpt != vocab_size
             println("Warning: Vocab size mismatch! Checkpoint=$(vocab_ckpt), New=$(vocab_size). Performing char-aligned merge.")
+            vocab_resized = true
             
             # Try to load char_maps for character-level alignment
             # We need: old_char_map (from checkpoint) and new_char_map (from current data)
@@ -910,6 +911,10 @@ function train(cfg)
             ps = ps_ckpt
         end
 
+        if vocab_resized && resume_opt_state !== nothing
+            println("Opt state reset due to vocab resize")
+            resume_opt_state = nothing
+        end
         if !haskey(ps, :norm)
             ps = merge(ps, (norm=ps0.norm,))
         end
