@@ -789,41 +789,122 @@ function train(cfg)
             train_step = Int(ckpt["train_step"])
         end
 
-        # Handle Vocabulary Expansion / Resizing
+        # Handle Vocabulary Expansion / Resizing using character-aligned merge
         vocab_ckpt = size(ps_ckpt.encoder.embedding.weight, 2)
         if vocab_ckpt != vocab_size
-            println("Warning: Vocab size mismatch in resumed checkpoint! Resizing from $(vocab_ckpt) to $(vocab_size).")
-            n_copy = min(vocab_ckpt, vocab_size)
+            println("Warning: Vocab size mismatch! Checkpoint=$(vocab_ckpt), New=$(vocab_size). Performing char-aligned merge.")
             
-            # 1. Resize encoder embedding
-            new_enc_embed = copy(ps0.encoder.embedding.weight)
-            new_enc_embed[:, 1:n_copy] .= ps_ckpt.encoder.embedding.weight[:, 1:n_copy]
-            ps_enc_new = merge(ps_ckpt.encoder, (embedding=(weight=new_enc_embed,),))
-            ps_new = merge(ps_ckpt, (encoder=ps_enc_new,))
+            # Try to load char_maps for character-level alignment
+            # We need: old_char_map (from checkpoint) and new_char_map (from current data)
+            old_char_map = nothing
+            new_char_map = nothing
             
-            # 2. Resize decoder if exists
-            if haskey(ps_ckpt, :decoder)
-                new_dec_embed = copy(ps0.decoder.embedding.weight)
-                if haskey(ps_ckpt.decoder, :embedding)
-                    new_dec_embed[:, 1:n_copy] .= ps_ckpt.decoder.embedding.weight[:, 1:n_copy]
+            # Load old char_map from a sibling _meta.jld2 if available  
+            ckpt_meta_path = replace(cfg.resume_ckpt, r"\.jld2$" => "_meta.jld2")
+            if isfile(ckpt_meta_path)
+                old_meta = JLD2.load(ckpt_meta_path)
+                if haskey(old_meta, "char_map")
+                    old_char_map = Dict{Char,Int}(old_meta["char_map"])
+                    println("Loaded old char_map from: $ckpt_meta_path ($(length(old_char_map)) chars)")
                 end
-                
-                new_dec_proj_w = copy(ps0.decoder.proj.weight)
-                new_dec_proj_b = copy(ps0.decoder.proj.bias)
-                if haskey(ps_ckpt.decoder, :proj)
-                    new_dec_proj_w[1:n_copy, :] .= ps_ckpt.decoder.proj.weight[1:n_copy, :]
-                    
-                    if length(size(ps_ckpt.decoder.proj.bias)) >= 2
-                        new_dec_proj_b[1:n_copy, 1] .= ps_ckpt.decoder.proj.bias[1:n_copy, 1]
-                    else
-                        new_dec_proj_b[1:n_copy] .= ps_ckpt.decoder.proj.bias[1:n_copy]
+            end
+            
+            # Load new char_map from new data meta_file
+            if isfile(cfg.meta_file)
+                new_meta = JLD2.load(cfg.meta_file)
+                if haskey(new_meta, "char_map")
+                    new_char_map = Dict{Char,Int}(new_meta["char_map"])
+                    println("Loaded new char_map from: $(cfg.meta_file) ($(length(new_char_map)) chars)")
+                end
+            end
+            
+            # Determine how to build the weight transfer function
+            if old_char_map !== nothing && new_char_map !== nothing
+                println("Performing character-aligned embedding merge (union of both vocabs).")
+
+                # Helper: copy embeddings by char identity
+                function merge_embed_by_char(w_old::AbstractMatrix, w_new_shape::AbstractMatrix, old_cm, new_cm)
+                    w_new = copy(w_new_shape)  # start from random init
+                    for (c, old_id) in old_cm
+                        new_id = get(new_cm, c, nothing)
+                        if new_id !== nothing
+                            old_col = old_id + 1
+                            new_col = new_id + 1
+                            if old_col >= 1 && old_col <= size(w_old, 2) && new_col >= 1 && new_col <= size(w_new, 2)
+                                w_new[:, new_col] .= w_old[:, old_col]
+                            end
+                        end
                     end
+                    return w_new
                 end
+                function merge_proj_by_char(w_old::AbstractMatrix, b_old::AbstractArray, w_new_shape, b_new_shape, old_cm, new_cm)
+                    w_new = copy(w_new_shape)
+                    b_new = copy(b_new_shape)
+                    for (c, old_id) in old_cm
+                        new_id = get(new_cm, c, nothing)
+                        if new_id !== nothing
+                            old_row = old_id + 1
+                            new_row = new_id + 1
+                            if old_row >= 1 && old_row <= size(w_old, 1) && new_row >= 1 && new_row <= size(w_new, 1)
+                                w_new[new_row, :] .= w_old[old_row, :]
+                                if ndims(b_old) >= 2
+                                    b_new[new_row, 1] = b_old[old_row, 1]
+                                else
+                                    b_new[new_row] = b_old[old_row]
+                                end
+                            end
+                        end
+                    end
+                    return w_new, b_new
+                end
+
+                new_enc_embed = merge_embed_by_char(
+                    ps_ckpt.encoder.embedding.weight, ps0.encoder.embedding.weight,
+                    old_char_map, new_char_map)
+                ps_enc_new = merge(ps_ckpt.encoder, (embedding=(weight=new_enc_embed,),))
+                ps_new = merge(ps_ckpt, (encoder=ps_enc_new,))
                 
-                ps_dec_new = merge(ps_ckpt.decoder, (embedding=(weight=new_dec_embed,), proj=(weight=new_dec_proj_w, bias=new_dec_proj_b)))
-                ps = merge(ps_new, (decoder=ps_dec_new,))
+                if haskey(ps_ckpt, :decoder)
+                    new_dec_embed = merge_embed_by_char(
+                        ps_ckpt.decoder.embedding.weight, ps0.decoder.embedding.weight,
+                        old_char_map, new_char_map)
+                    new_dec_proj_w, new_dec_proj_b = merge_proj_by_char(
+                        ps_ckpt.decoder.proj.weight, ps_ckpt.decoder.proj.bias,
+                        ps0.decoder.proj.weight, ps0.decoder.proj.bias,
+                        old_char_map, new_char_map)
+                    ps_dec_new = merge(ps_ckpt.decoder, (embedding=(weight=new_dec_embed,), proj=(weight=new_dec_proj_w, bias=new_dec_proj_b)))
+                    ps = merge(ps_new, (decoder=ps_dec_new,))
+                else
+                    ps = ps_new
+                end
             else
-                ps = ps_new
+                # Fallback: positional copy (old behavior, less accurate if vocab order changed)
+                println("char_map not available for alignment; falling back to positional copy.")
+                n_copy = min(vocab_ckpt, vocab_size)
+                
+                new_enc_embed = copy(ps0.encoder.embedding.weight)
+                new_enc_embed[:, 1:n_copy] .= ps_ckpt.encoder.embedding.weight[:, 1:n_copy]
+                ps_enc_new = merge(ps_ckpt.encoder, (embedding=(weight=new_enc_embed,),))
+                ps_new = merge(ps_ckpt, (encoder=ps_enc_new,))
+                
+                if haskey(ps_ckpt, :decoder)
+                    new_dec_embed = copy(ps0.decoder.embedding.weight)
+                    new_dec_embed[:, 1:n_copy] .= ps_ckpt.decoder.embedding.weight[:, 1:n_copy]
+                    new_dec_proj_w = copy(ps0.decoder.proj.weight)
+                    new_dec_proj_b = copy(ps0.decoder.proj.bias)
+                    if haskey(ps_ckpt.decoder, :proj)
+                        new_dec_proj_w[1:n_copy, :] .= ps_ckpt.decoder.proj.weight[1:n_copy, :]
+                        if length(size(ps_ckpt.decoder.proj.bias)) >= 2
+                            new_dec_proj_b[1:n_copy, 1] .= ps_ckpt.decoder.proj.bias[1:n_copy, 1]
+                        else
+                            new_dec_proj_b[1:n_copy] .= ps_ckpt.decoder.proj.bias[1:n_copy]
+                        end
+                    end
+                    ps_dec_new = merge(ps_ckpt.decoder, (embedding=(weight=new_dec_embed,), proj=(weight=new_dec_proj_w, bias=new_dec_proj_b)))
+                    ps = merge(ps_new, (decoder=ps_dec_new,))
+                else
+                    ps = ps_new
+                end
             end
         else
             ps = ps_ckpt

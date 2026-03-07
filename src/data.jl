@@ -31,8 +31,9 @@ function resolve_config(cli::Dict{Symbol,Any})
     meta_file = string(get(cli, :meta_file, DEFAULT_META_FILE))
     paragraph_eos_str = string(get(cli, :paragraph_eos, "false"))
     paragraph_eos = lowercase(paragraph_eos_str) == "true" || paragraph_eos_str == "1"
+    base_meta = string(get(cli, :base_meta, ""))
 
-    return (; data_dir, parquet_file, tokenizer_name, max_docs, char_vocab_docs, output_file, meta_file, paragraph_eos)
+    return (; data_dir, parquet_file, tokenizer_name, max_docs, char_vocab_docs, output_file, meta_file, paragraph_eos, base_meta)
 end
 
 function resolve_output_file(mode::AbstractString, data_dir::AbstractString, tokenizer_name::AbstractString; output_file::AbstractString="")
@@ -154,17 +155,45 @@ function encode_chars(s::String, char_map, unk_id::Int)
     return out
 end
 
-function process_data_char_stream(texts, output_file::AbstractString, meta_file::AbstractString, char_vocab_docs::Int, paragraph_eos::Bool)
-    sample_texts = texts[1:min(end, char_vocab_docs)]
-    vocab_chars = sort!(collect(build_char_set(sample_texts)))
-
-    # 1=PAD, 2=EOS, 3=UNK, 4=MASK
-    char_map = Dict{Char,Int}(c => i + 4 for (i, c) in enumerate(vocab_chars))
+function process_data_char_stream(texts, output_file::AbstractString, meta_file::AbstractString, char_vocab_docs::Int, paragraph_eos::Bool, base_meta_file::AbstractString="")
+    # --- Vocabulary Building ---
+    # If base_meta is provided, load the existing char_map and extend it.
+    # This ensures old character IDs are preserved (no positional drift).
     PAD_ID = 1
     EOS_ID = 2
     UNK_ID = 3
     MASK_ID = 4
-    vocab_size = length(char_map) + 4
+
+    base_char_map = Dict{Char,Int}()
+    if !isempty(base_meta_file) && isfile(base_meta_file)
+        println("Loading base vocabulary from: $base_meta_file")
+        old_meta = JLD2.load(base_meta_file)
+        if haskey(old_meta, "char_map")
+            base_char_map = Dict{Char,Int}(old_meta["char_map"])
+            println("Base vocab loaded: $(length(base_char_map)) chars")
+        end
+    end
+
+    # Scan a sample of texts to discover characters
+    sample_texts = texts[1:min(end, char_vocab_docs)]
+    new_chars = build_char_set(sample_texts)
+
+    # Merge: copy all old char IDs, assign new incremental IDs only to genuinely new chars
+    char_map = copy(base_char_map)
+    next_id = isempty(char_map) ? (MASK_ID + 1) : (maximum(values(char_map)) + 1)
+    n_new = 0
+    for c in sort!(collect(new_chars))
+        if !haskey(char_map, c)
+            char_map[c] = next_id
+            next_id += 1
+            n_new += 1
+        end
+    end
+    if n_new > 0
+        println("Added $n_new new characters to vocabulary (total: $(length(char_map)))")
+    end
+
+    vocab_size = isempty(char_map) ? MASK_ID : (maximum(values(char_map)) + 1)
 
     println("Vocabulary size: $vocab_size")
 
@@ -352,7 +381,7 @@ function process(cfg)
     meta_file = resolve_meta_file(output_file; meta_file=cfg.meta_file)
     
     if mode == "char"
-        process_data_char_stream(texts, output_file, meta_file, cfg.char_vocab_docs, cfg.paragraph_eos)
+        process_data_char_stream(texts, output_file, meta_file, cfg.char_vocab_docs, cfg.paragraph_eos, cfg.base_meta)
     else
         process_data_tokenizer_stream(texts, output_file, meta_file, cfg.tokenizer_name, cfg.paragraph_eos)
     end
@@ -368,6 +397,7 @@ function data_prep(args::Vector{String})
         println("  --tokenizer-name <str>    HuggingFace tokenizer name (or empty for char-level)")
         println("  --output-file <path>      Output .jld2 file path")
         println("  --max-docs <int>          Limit number of documents")
+        println("  --base-meta <path>         Base meta .jld2 file to inherit vocab from (optional, for incremental datasets)")
         println("  --paragraph-eos <bool>    Inject EOS at paragraph boundaries (true/false, default: false)")
         return
     end
