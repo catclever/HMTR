@@ -56,6 +56,7 @@ const ENCODER_DTYPE = get(ENV, "ENCODER_DTYPE", "")
 const NORM_DTYPE = get(ENV, "NORM_DTYPE", "")
 const DECODER_DTYPE = get(ENV, "DECODER_DTYPE", "")
 const RESUME_CKPT = get(ENV, "RESUME_CKPT", "")
+const RESUME_META_FILE = get(ENV, "RESUME_META_FILE", "")
 const SEQ_LEN = parse(Int, get(ENV, "SEQ_LEN", "1024"))
 
 function parse_ckpt_epoch_step(path::AbstractString)
@@ -141,6 +142,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     if resume_ckpt == "true"
         resume_ckpt = ""
     end
+    resume_meta_file = string(get(cli, :resume_meta_file, get(cli, :resume_meta, RESUME_META_FILE)))
 
     # Smart path resolution:
     # 1. Check if path exists as-is (absolute or relative to CWD)
@@ -151,6 +153,17 @@ function resolve_config(cli::Dict{Symbol,Any})
             resume_ckpt = alt_path
         elseif isfile(joinpath(checkpoint_dir, resume_ckpt))
             resume_ckpt = joinpath(checkpoint_dir, resume_ckpt)
+        end
+    end
+    if isempty(resume_meta_file) && !isempty(resume_ckpt)
+        resume_meta_file = replace(resume_ckpt, r"\.jld2$" => "_meta.jld2")
+    end
+    if !isempty(resume_meta_file) && !isfile(resume_meta_file)
+        alt_meta_path = joinpath(checkpoint_dir, basename(resume_meta_file))
+        if isfile(alt_meta_path)
+            resume_meta_file = alt_meta_path
+        else
+            resume_meta_file = ""
         end
     end
 
@@ -195,6 +208,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         skip_on_spike,
         pretrain_emb_file,
         resume_ckpt,
+        resume_meta_file,
         resume_epoch,
         resume_step,
         inspect_data,
@@ -802,11 +816,12 @@ function train(cfg)
             
             # Load old char_map from a sibling _meta.jld2 if available  
             ckpt_meta_path = replace(cfg.resume_ckpt, r"\.jld2$" => "_meta.jld2")
-            if isfile(ckpt_meta_path)
-                old_meta = JLD2.load(ckpt_meta_path)
+            old_meta_path = !isempty(cfg.resume_meta_file) ? cfg.resume_meta_file : ckpt_meta_path
+            if isfile(old_meta_path)
+                old_meta = JLD2.load(old_meta_path)
                 if haskey(old_meta, "char_map")
                     old_char_map = Dict{Char,Int}(old_meta["char_map"])
-                    println("Loaded old char_map from: $ckpt_meta_path ($(length(old_char_map)) chars)")
+                    println("Loaded old char_map from: $old_meta_path ($(length(old_char_map)) chars)")
                 end
             end
             
@@ -1146,6 +1161,7 @@ function train_stage1(args::Vector{String})
         println("  --data-file <path>        Path to processed data file (default: \$DATA_FILE)")
         println("  --meta-file <path>        Path to metadata file (default: derived from data-file)")
         println("  --checkpoint-dir <path>   Directory to save checkpoints")
+        println("  --resume-meta-file <path> Path to old meta for vocab alignment")
         println("  --epochs <int>            Number of epochs")
         println("  --batch-size <int>        Batch size")
         println("  --lr <float>              Learning rate")

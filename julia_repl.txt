@@ -57,6 +57,7 @@ HMTR.main([
     "--checkpoint-dir", "/home/HMTR/checkpoints",
     "--checkpoint-prefix", "ckpt_pad_aware_stage1_stream_seq512",
     "--resume-ckpt", "/home/HMTR/checkpoints/ckpt_pad_aware_stage1_stream_seq512_ds32_20260305_145517_epoch1.jld2",
+    "--resume-meta-file", "/home/HMTR/data/processed_stream_char_20260218_111813_meta.jld2",
     "--epochs", "1",
     "--batch-size", "8",
     "--lr", "1e-4",
