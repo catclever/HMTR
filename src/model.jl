@@ -120,22 +120,32 @@ Lux.initialparameters(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
 Lux.initialstates(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
     in_proj=Lux.initialstates(rng, l.in_proj),
     out_proj=Lux.initialstates(rng, l.out_proj),
-    adt_proj=Lux.initialstates(rng, l.adt_proj)
+    adt_proj=Lux.initialstates(rng, l.adt_proj),
+    h=nothing
 )
 
-# The scan function
-# x: [D, L, B]
-function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
+function mamba_init_state(x, A, h_prev)
     d_model, L, batch = size(x)
     d_state = size(A, 2)
-    h = similar(x, d_model, d_state, batch)
-    fill!(h, zero(eltype(h)))
+    if h_prev isa AbstractArray && ndims(h_prev) == 3 &&
+       size(h_prev, 1) == d_model && size(h_prev, 2) == d_state && size(h_prev, 3) == batch
+        return copy(h_prev)
+    end
+    h0 = similar(x, d_model, d_state, batch)
+    fill!(h0, zero(eltype(h0)))
+    return h0
+end
+
+function mamba_scan(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing)
+    d_model, L, batch = size(x)
+    d_state = size(A, 2)
+    h = mamba_init_state(x, A, h_prev)
 
     D2 = reshape(D, d_model, 1)
     A2 = reshape(A, d_model, d_state, 1)
 
     if L == 0
-        return similar(x, d_model, 0, batch)
+        return similar(x, d_model, 0, batch), h
     end
     ys = similar(x, d_model, L, batch)
 
@@ -154,20 +164,19 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
         C3 = reshape(Ct, 1, d_state, batch)
 
         decay = exp.(A2 .* dt3)
-        h = h .* decay .+ (B3 .* dt3) .* xt3
+        h .= h .* decay .+ (B3 .* dt3) .* xt3
 
         y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
         @views ys[:, t, :] .= y
     end
 
-    return ys
+    return ys, h
 end
 
-function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
+function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing)
     d_model, L, batch = size(x)
     d_state = size(A, 2)
-    h = similar(x, d_model, d_state, batch)
-    fill!(h, zero(eltype(h)))
+    h = mamba_init_state(x, A, h_prev)
 
     D2 = reshape(D, d_model, 1)
     A2 = reshape(A, d_model, d_state, 1)
@@ -199,17 +208,24 @@ function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
         @views hs[:, :, :, t] .= h
     end
 
-    return ys, hs
+    return ys, h, hs
 end
 
-function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D)
-    y, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
+function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D, h_prev)
+    y, h_last, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev)
 
-    function pullback(ȳ)
+    function pullback(ȳ_pair)
+        if ȳ_pair isa ChainRulesCore.AbstractZero
+            return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent())
+        end
+
+        ȳ = (ȳ_pair isa Tuple || ȳ_pair isa ChainRulesCore.Tangent) ? ȳ_pair[1] : ȳ_pair
         if ȳ isa ChainRulesCore.AbstractZero
             return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
                 ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
-                ChainRulesCore.ZeroTangent())
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent())
         end
 
         d_model, L, batch = size(x)
@@ -231,8 +247,7 @@ function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, 
         D2 = reshape(D, d_model, 1)
         A2 = reshape(A, d_model, d_state, 1)
 
-        h0 = similar(hs, d_model, d_state, batch)
-        fill!(h0, zero(eltype(h0)))
+        h0 = mamba_init_state(x, A, h_prev)
 
         gh = similar(h0)
         fill!(gh, zero(eltype(gh)))
@@ -289,10 +304,10 @@ function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, 
             gh .= gh .* decay
         end
 
-        return (ChainRulesCore.NoTangent(), dx, ddt_raw, dB_raw, dC_raw, dA, dD)
+        return (ChainRulesCore.NoTangent(), dx, ddt_raw, dB_raw, dC_raw, dA, dD, ChainRulesCore.ZeroTangent())
     end
 
-    return y, pullback
+    return (y, h_last), pullback
 end
 
 function (l::SimplifiedMambaBlock)(x, ps, st)
@@ -308,11 +323,13 @@ function (l::SimplifiedMambaBlock)(x, ps, st)
     B_raw = @view adt[d+1:d+d_state, :, :]
     C_raw = @view adt[d+d_state+1:d+2d_state, :, :]
 
-    y_scan = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D)
+    h_prev = haskey(st, :h) ? st.h : nothing
+    h_in = h_prev === nothing ? nothing : Zygote.dropgrad(h_prev)
+    y_scan, h_next = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D, h_in)
     y = y_scan .* NNlib.swish.(z_branch)
 
     out = l.out_proj(y, ps.out_proj, st.out_proj)[1]
-    return out .+ x, (in_proj=st.in_proj, out_proj=st.out_proj, adt_proj=st_adt)
+    return out .+ x, (in_proj=st.in_proj, out_proj=st.out_proj, adt_proj=st_adt, h=Zygote.dropgrad(h_next))
 end
 
 # --- 1. Mamba Encoder ---

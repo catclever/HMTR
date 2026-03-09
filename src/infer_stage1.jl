@@ -7,6 +7,7 @@ using Printf
 using CUDA
 using LuxCUDA
 using Statistics
+using Unicode
 using ..Utils
 using ..Model
 
@@ -198,7 +199,14 @@ function load_meta(data_file::AbstractString, meta_file::AbstractString)
     return (; block_size, vocab_size, pad_id, eos_id, unk_id, char_map=char_map2, id_to_char, vocab)
 end
 
-normalize_text(x) = x === missing ? "" : String(x)
+normalize_text(x) = x === missing ? "" : normalize_text(String(x))
+
+function normalize_text(s::String)
+    s = Unicode.normalize(s, :NFKC)
+    s = replace(s, '\r' => '\n')
+    s = replace(s, r"[^\S\n]+" => " ")
+    return s
+end
 
 function encode_text_to_blocks(text::AbstractString, meta)
     s = normalize_text(text)

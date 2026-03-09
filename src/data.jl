@@ -9,6 +9,7 @@ if get(ENV, "JULIA_PYTHONCALL_EXE", "") == ""
 end
 using PythonCall
 using Dates
+using Unicode
 using ..Utils
 
 export data_prep
@@ -20,6 +21,7 @@ const DEFAULT_TOKENIZER_NAME = get(ENV, "TOKENIZER_NAME", "")
 const DEFAULT_MAX_DOCS = parse(Int, get(ENV, "MAX_DOCS", "0"))
 const DEFAULT_CHAR_VOCAB_DOCS = parse(Int, get(ENV, "CHAR_VOCAB_DOCS", "10000"))
 const DEFAULT_META_FILE = get(ENV, "META_FILE", "")
+const DEFAULT_PRESERVE_WIDTH = parse(Int, get(ENV, "PRESERVE_WIDTH", "0"))
 
 function resolve_config(cli::Dict{Symbol,Any})
     data_dir = string(get(cli, :data_dir, DEFAULT_DATA_DIR))
@@ -32,8 +34,10 @@ function resolve_config(cli::Dict{Symbol,Any})
     paragraph_eos_str = string(get(cli, :paragraph_eos, "false"))
     paragraph_eos = lowercase(paragraph_eos_str) == "true" || paragraph_eos_str == "1"
     base_meta = string(get(cli, :base_meta, ""))
+    preserve_width_str = string(get(cli, :preserve_width, DEFAULT_PRESERVE_WIDTH))
+    preserve_width = lowercase(preserve_width_str) == "true" || preserve_width_str == "1"
 
-    return (; data_dir, parquet_file, tokenizer_name, max_docs, char_vocab_docs, output_file, meta_file, paragraph_eos, base_meta)
+    return (; data_dir, parquet_file, tokenizer_name, max_docs, char_vocab_docs, output_file, meta_file, paragraph_eos, base_meta, preserve_width)
 end
 
 function resolve_output_file(mode::AbstractString, data_dir::AbstractString, tokenizer_name::AbstractString; output_file::AbstractString="")
@@ -85,7 +89,15 @@ function load_parquet_data(path::String)
     end
 end
 
-normalize_text(x) = x === missing ? "" : String(x)
+normalize_text(x; preserve_width::Bool=false) = x === missing ? "" : normalize_text(String(x); preserve_width=preserve_width)
+
+function normalize_text(s::String; preserve_width::Bool=false)
+    norm_form = preserve_width ? :NFC : :NFKC
+    s = Unicode.normalize(s, norm_form)
+    s = replace(s, '\r' => '\n')
+    s = replace(s, r"[^\S\n]+" => " ")
+    return s
+end
 
 function init_tokenizer(tokenizer_name::AbstractString)
     transformers = try
@@ -134,10 +146,10 @@ function encode_ids(tokenizer, s::String)
     return pyconvert(Vector{Int}, ids_py)
 end
 
-function build_char_set(texts)
+function build_char_set(texts; preserve_width::Bool=false)
     chars = Set{Char}()
     for t in texts
-        s = normalize_text(t)
+        s = normalize_text(t; preserve_width=preserve_width)
         for c in s
             push!(chars, c)
         end
@@ -155,7 +167,7 @@ function encode_chars(s::String, char_map, unk_id::Int)
     return out
 end
 
-function process_data_char_stream(texts, output_file::AbstractString, meta_file::AbstractString, char_vocab_docs::Int, paragraph_eos::Bool, base_meta_file::AbstractString="")
+function process_data_char_stream(texts, output_file::AbstractString, meta_file::AbstractString, char_vocab_docs::Int, paragraph_eos::Bool, base_meta_file::AbstractString=""; preserve_width::Bool=false)
     # --- Vocabulary Building ---
     # If base_meta is provided, load the existing char_map and extend it.
     # This ensures old character IDs are preserved (no positional drift).
@@ -176,7 +188,7 @@ function process_data_char_stream(texts, output_file::AbstractString, meta_file:
 
     # Scan a sample of texts to discover characters
     sample_texts = texts[1:min(end, char_vocab_docs)]
-    new_chars = build_char_set(sample_texts)
+    new_chars = build_char_set(sample_texts; preserve_width=preserve_width)
 
     # Merge: copy all old char IDs, assign new incremental IDs only to genuinely new chars
     char_map = copy(base_char_map)
@@ -208,7 +220,7 @@ function process_data_char_stream(texts, output_file::AbstractString, meta_file:
             println("Processing doc $idx / $total_docs")
         end
 
-        s = normalize_text(doc)
+        s = normalize_text(doc; preserve_width=preserve_width)
         isempty(s) && continue
 
         # Track if this is the very first token of the document
@@ -272,7 +284,7 @@ function process_data_char_stream(texts, output_file::AbstractString, meta_file:
     println("Done.")
 end
 
-function process_data_tokenizer_stream(texts, output_file::AbstractString, meta_file::AbstractString, tokenizer_name::AbstractString, paragraph_eos::Bool)
+function process_data_tokenizer_stream(texts, output_file::AbstractString, meta_file::AbstractString, tokenizer_name::AbstractString, paragraph_eos::Bool; preserve_width::Bool=false)
     tokenizer, vocab_size, PAD_ID, EOS_ID, UNK_ID, MASK_ID, id_to_token = init_tokenizer(tokenizer_name)
     
     # If MASK_ID was UNK (-1), force assign one if space allows? 
@@ -295,7 +307,7 @@ function process_data_tokenizer_stream(texts, output_file::AbstractString, meta_
             println("Processing doc $idx / $total_docs")
         end
 
-        s = normalize_text(doc)
+        s = normalize_text(doc; preserve_width=preserve_width)
         isempty(s) && continue
 
         is_first_doc_token = true
@@ -381,9 +393,9 @@ function process(cfg)
     meta_file = resolve_meta_file(output_file; meta_file=cfg.meta_file)
     
     if mode == "char"
-        process_data_char_stream(texts, output_file, meta_file, cfg.char_vocab_docs, cfg.paragraph_eos, cfg.base_meta)
+        process_data_char_stream(texts, output_file, meta_file, cfg.char_vocab_docs, cfg.paragraph_eos, cfg.base_meta; preserve_width=cfg.preserve_width)
     else
-        process_data_tokenizer_stream(texts, output_file, meta_file, cfg.tokenizer_name, cfg.paragraph_eos)
+        process_data_tokenizer_stream(texts, output_file, meta_file, cfg.tokenizer_name, cfg.paragraph_eos; preserve_width=cfg.preserve_width)
     end
     return
 end
@@ -399,6 +411,7 @@ function data_prep(args::Vector{String})
         println("  --max-docs <int>          Limit number of documents")
         println("  --base-meta <path>         Base meta .jld2 file to inherit vocab from (optional, for incremental datasets)")
         println("  --paragraph-eos <bool>    Inject EOS at paragraph boundaries (true/false, default: false)")
+        println("  --preserve-width <bool>   Keep full-width and half-width as different chars")
         return
     end
     cli = Utils.parse_cli_args(args)

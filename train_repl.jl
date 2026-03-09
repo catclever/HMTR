@@ -1,0 +1,43 @@
+using Pkg
+Pkg.activate(".")
+using HMTR
+
+# Optimized Training Command for REPL
+# Includes new parameters for variance regularization and loss scheduling
+# Usage: include("train_repl.jl")
+
+args = [
+    "--data-file", "/home/HMTR/data/processed_stream_char_20260218_111813.jld2",
+    "--meta-file", "/home/HMTR/data/processed_stream_char_20260218_111813_meta.jld2",
+    "--checkpoint-dir", "/home/HMTR/checkpoints",
+    "--checkpoint-prefix", "ckpt_stage1_opt",
+    "--epochs", "5",
+    "--batch-size", "8",
+    "--lr", "1e-3",
+    "--dim", "256",
+    "--mamba-d-state", "32",
+    "--warmup-steps", "500",
+    "--max-batches", "0",
+    "--save-every", "5000",
+    "--grad-clip-norm", "5.0",
+    "--loss-spike-threshold", "10.5",
+    "--skip-on-spike", "1",
+    "--kl-weight", "1e-4",
+    "--pred-weight", "1.0",
+    "--var-dir-weight", "0.15",
+    "--var-mag-weight", "0.01",
+    "--dtype", "fp32",
+    "--seq-len", "512",
+    "--auto-loss-balance", "1",
+    "--var-mag-low", "0.2",
+    "--var-mag-high", "3.5",
+    "--pred-warmup-frac", "0.1",
+    "--var-dir-start-frac", "0.1",
+    "--var-dir-full-frac", "0.4",
+    "--pred-decay-start-frac", "0.75",
+    "--pred-decay-end-scale", "0.6",
+    "--add-timestamp", "1"
+]
+
+println("Starting Optimized Training in REPL...")
+HMTR.train_stage1(args)

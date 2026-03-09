@@ -41,8 +41,20 @@ const GRAD_CLIP_NORM = parse(Float64, get(ENV, "GRAD_CLIP_NORM", "5.0"))
 const LOSS_SPIKE_THRESHOLD = parse(Float64, get(ENV, "LOSS_SPIKE_THRESHOLD", "10.0"))
 const SKIP_ON_SPIKE = parse(Int, get(ENV, "SKIP_ON_SPIKE", "1"))
 const WARMUP_STEPS = parse(Int, get(ENV, "WARMUP_STEPS", "500"))
-const KL_WEIGHT = parse(Float64, get(ENV, "KL_WEIGHT", "0.0001"))
+const KL_WEIGHT = parse(Float64, get(ENV, "KL_WEIGHT", "0.0"))
 const PRED_WEIGHT = parse(Float64, get(ENV, "PRED_WEIGHT", "1.0"))
+const VAR_DIR_WEIGHT = parse(Float64, get(ENV, "VAR_DIR_WEIGHT", "0.15"))
+const VAR_MAG_WEIGHT = parse(Float64, get(ENV, "VAR_MAG_WEIGHT", "0.01"))
+const VAR_MAG_LOW = parse(Float64, get(ENV, "VAR_MAG_LOW", "0.2"))
+const VAR_MAG_HIGH = parse(Float64, get(ENV, "VAR_MAG_HIGH", "3.5"))
+const AUTO_LOSS_BALANCE = parse(Int, get(ENV, "AUTO_LOSS_BALANCE", "1"))
+const TARGET_PRED_RATIO = parse(Float64, get(ENV, "TARGET_PRED_RATIO", "0.25"))
+const TARGET_VAR_DIR_RATIO = parse(Float64, get(ENV, "TARGET_VAR_DIR_RATIO", "0.10"))
+const PRED_WARMUP_FRAC = parse(Float64, get(ENV, "PRED_WARMUP_FRAC", "0.10"))
+const VAR_DIR_START_FRAC = parse(Float64, get(ENV, "VAR_DIR_START_FRAC", "0.10"))
+const VAR_DIR_FULL_FRAC = parse(Float64, get(ENV, "VAR_DIR_FULL_FRAC", "0.40"))
+const PRED_DECAY_START_FRAC = parse(Float64, get(ENV, "PRED_DECAY_START_FRAC", "0.75"))
+const PRED_DECAY_END_SCALE = parse(Float64, get(ENV, "PRED_DECAY_END_SCALE", "0.60"))
 const TEACHER_FORCING = parse(Int, get(ENV, "TEACHER_FORCING", "0"))
 
 const PRETRAIN_EMB_FILE = get(ENV, "PRETRAIN_EMB_FILE", "")
@@ -81,6 +93,50 @@ end
 
 
 function resolve_config(cli::Dict{Symbol,Any})
+    # 1. Resolve resume_ckpt first to load config defaults
+    resume_ckpt = string(get(cli, :resume_ckpt, get(cli, :resume, get(cli, :resume_from, RESUME_CKPT))))
+    if resume_ckpt == "true"
+        resume_ckpt = ""
+    end
+    
+    checkpoint_dir = get(cli, :checkpoint_dir, CHECKPOINT_DIR)
+    # Smart path resolution for resume_ckpt
+    if !isempty(resume_ckpt) && !isfile(resume_ckpt)
+        alt_path = joinpath(checkpoint_dir, basename(resume_ckpt))
+        if isfile(alt_path)
+            resume_ckpt = alt_path
+        elseif isfile(joinpath(checkpoint_dir, resume_ckpt))
+            resume_ckpt = joinpath(checkpoint_dir, resume_ckpt)
+        end
+    end
+
+    # 2. Load config from checkpoint if available
+    ckpt_meta_data = nothing
+    if !isempty(resume_ckpt) && isfile(resume_ckpt)
+        try
+            JLD2.jldopen(resume_ckpt, "r") do file
+                if haskey(file, "config")
+                    ckpt_config = file["config"]
+                    # Merge ckpt_config into cli (CLI takes precedence)
+                    # We only add keys that are NOT in cli
+                    if ckpt_config isa NamedTuple || ckpt_config isa AbstractDict
+                        for k in keys(ckpt_config)
+                            if !haskey(cli, k)
+                                cli[k] = ckpt_config[k]
+                            end
+                        end
+                    end
+                end
+                if haskey(file, "meta_data")
+                    ckpt_meta_data = file["meta_data"]
+                end
+            end
+            println("Loaded configuration from checkpoint: $resume_ckpt")
+        catch e
+            @warn "Failed to load config from checkpoint: $e"
+        end
+    end
+
     data_file = get(cli, :data_file, DATA_FILE)
     if !isabspath(data_file)
         if !isfile(data_file) && isfile(joinpath(DATA_DIR, data_file))
@@ -130,6 +186,25 @@ function resolve_config(cli::Dict{Symbol,Any})
     warmup_steps = parse(Int, string(get(cli, :warmup_steps, WARMUP_STEPS)))
     kl_weight = parse(Float64, string(get(cli, :kl_weight, KL_WEIGHT)))
     pred_weight = parse(Float64, string(get(cli, :pred_weight, PRED_WEIGHT)))
+    var_dir_weight = parse(Float64, string(get(cli, :var_dir_weight, VAR_DIR_WEIGHT)))
+    var_mag_weight = parse(Float64, string(get(cli, :var_mag_weight, VAR_MAG_WEIGHT)))
+    var_mag_low = parse(Float64, string(get(cli, :var_mag_low, VAR_MAG_LOW)))
+    var_mag_high = parse(Float64, string(get(cli, :var_mag_high, VAR_MAG_HIGH)))
+    auto_loss_balance = parse_bool(:auto_loss_balance, AUTO_LOSS_BALANCE)
+    target_pred_ratio = parse(Float64, string(get(cli, :target_pred_ratio, TARGET_PRED_RATIO)))
+    target_var_dir_ratio = parse(Float64, string(get(cli, :target_var_dir_ratio, TARGET_VAR_DIR_RATIO)))
+    pred_warmup_frac = parse(Float64, string(get(cli, :pred_warmup_frac, PRED_WARMUP_FRAC)))
+    var_dir_start_frac = parse(Float64, string(get(cli, :var_dir_start_frac, VAR_DIR_START_FRAC)))
+    var_dir_full_frac = parse(Float64, string(get(cli, :var_dir_full_frac, VAR_DIR_FULL_FRAC)))
+    pred_decay_start_frac = parse(Float64, string(get(cli, :pred_decay_start_frac, PRED_DECAY_START_FRAC)))
+    pred_decay_end_scale = parse(Float64, string(get(cli, :pred_decay_end_scale, PRED_DECAY_END_SCALE)))
+    pred_warmup_frac = clamp(pred_warmup_frac, 0.0, 1.0)
+    var_dir_start_frac = clamp(var_dir_start_frac, 0.0, 1.0)
+    var_dir_full_frac = clamp(var_dir_full_frac, var_dir_start_frac, 1.0)
+    pred_decay_start_frac = clamp(pred_decay_start_frac, 0.0, 1.0)
+    pred_decay_end_scale = clamp(pred_decay_end_scale, 0.0, 1.0)
+    var_mag_low = max(var_mag_low, 0.0)
+    var_mag_high = max(var_mag_high, var_mag_low + 1e-6)
     teacher_forcing = parse_bool(:teacher_forcing, TEACHER_FORCING)
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
@@ -138,23 +213,8 @@ function resolve_config(cli::Dict{Symbol,Any})
     decoder_dtype = string(get(cli, :decoder_dtype, DECODER_DTYPE))
     seq_len = parse(Int, string(get(cli, :seq_len, SEQ_LEN)))
 
-    resume_ckpt = string(get(cli, :resume_ckpt, get(cli, :resume, get(cli, :resume_from, RESUME_CKPT))))
-    if resume_ckpt == "true"
-        resume_ckpt = ""
-    end
     resume_meta_file = string(get(cli, :resume_meta_file, get(cli, :resume_meta, RESUME_META_FILE)))
 
-    # Smart path resolution:
-    # 1. Check if path exists as-is (absolute or relative to CWD)
-    # 2. If not, try relative to checkpoint_dir
-    if !isempty(resume_ckpt) && !isfile(resume_ckpt)
-        alt_path = joinpath(checkpoint_dir, basename(resume_ckpt))
-        if isfile(alt_path)
-            resume_ckpt = alt_path
-        elseif isfile(joinpath(checkpoint_dir, resume_ckpt))
-            resume_ckpt = joinpath(checkpoint_dir, resume_ckpt)
-        end
-    end
     if isempty(resume_meta_file) && !isempty(resume_ckpt)
         resume_meta_file = replace(resume_ckpt, r"\.jld2$" => "_meta.jld2")
     end
@@ -221,8 +281,21 @@ function resolve_config(cli::Dict{Symbol,Any})
         warmup_steps,
         kl_weight,
         pred_weight,
+        var_dir_weight,
+        var_mag_weight,
+        var_mag_low,
+        var_mag_high,
+        auto_loss_balance,
+        target_pred_ratio,
+        target_var_dir_ratio,
+        pred_warmup_frac,
+        var_dir_start_frac,
+        var_dir_full_frac,
+        pred_decay_start_frac,
+        pred_decay_end_scale,
         teacher_forcing,
         seq_len,
+        meta_data = ckpt_meta_data,
     )
 end
 
@@ -416,7 +489,7 @@ function ChainRulesCore.rrule(::Type{CUDA.CuArray}, x::AbstractArray)
 end
 
 
-function load_data(data_file::AbstractString, meta_file::AbstractString)
+function load_data(data_file::AbstractString, meta_file::AbstractString; meta_data_override=nothing)
     if !isfile(data_file)
         error("Data file $(data_file) not found!")
     end
@@ -437,7 +510,9 @@ function load_data(data_file::AbstractString, meta_file::AbstractString)
         is_bucketed = isa(data_content, AbstractDict)
     end
 
-    meta_src = if isfile(meta_file)
+    meta_src = if meta_data_override !== nothing
+        meta_data_override
+    elseif isfile(meta_file)
         JLD2.load(meta_file)
     else
         data_obj
@@ -460,7 +535,7 @@ function load_data(data_file::AbstractString, meta_file::AbstractString)
     # Try to get MASK ID
     mask_id = get(params, "MASK", get(params, "UNK", 3))
 
-    return data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab
+    return data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab, meta_src
 end
 
 function decode_ids(ids::AbstractVector{Int}, vocab, pad_id::Int, eos_id::Int)
@@ -502,8 +577,68 @@ function print_training_samples(x::AbstractMatrix{Int}, vocab, pad_id::Int, eos_
     return
 end
 
-function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0, teacher_forcing::Bool=false)
-    # Forward pass: (logits, mu, logvar, z, z_pred), st_new
+function _phase_ramp(progress::Float32, start::Float32, full::Float32)
+    if progress <= start
+        return 0f0
+    elseif progress >= full
+        return 1f0
+    else
+        return (progress - start) / max(full - start, 1f-6)
+    end
+end
+
+function _phase_decay(progress::Float32, start::Float32, end_scale::Float32)
+    if progress <= start
+        return 1f0
+    else
+        ratio = (progress - start) / max(1f0 - start, 1f-6)
+        ratio = clamp(ratio, 0f0, 1f0)
+        return 1f0 - (1f0 - end_scale) * ratio
+    end
+end
+
+function compute_adaptive_loss_weights(cfg, train_step::Int, total_steps::Int, ema)
+    progress = Float32(train_step) / max(Float32(total_steps), 1f0)
+    pred_phase = _phase_ramp(progress, 0f0, Float32(cfg.pred_warmup_frac))
+    pred_decay = _phase_decay(progress, Float32(cfg.pred_decay_start_frac), Float32(cfg.pred_decay_end_scale))
+    var_dir_phase = _phase_ramp(progress, Float32(cfg.var_dir_start_frac), Float32(cfg.var_dir_full_frac))
+
+    pred_weight = Float32(cfg.pred_weight) * pred_phase * pred_decay
+    var_dir_weight = Float32(cfg.var_dir_weight) * var_dir_phase
+    var_mag_weight = Float32(cfg.var_mag_weight)
+
+    if cfg.auto_loss_balance
+        recon_ema = max(ema.recon, 1f-6)
+        pred_ratio = ema.pred / recon_ema
+        var_dir_ratio = ema.var_dir / recon_ema
+        pred_gain = clamp(Float32(cfg.target_pred_ratio) / max(pred_ratio, 1f-4), 0.5f0, 2f0)
+        var_dir_gain = clamp(Float32(cfg.target_var_dir_ratio) / max(var_dir_ratio, 1f-4), 0.5f0, 2f0)
+        pred_weight *= pred_gain
+        var_dir_weight *= var_dir_gain
+
+        abs_logvar = ema.abs_logvar
+        if abs_logvar > Float32(cfg.var_mag_high)
+            var_mag_weight *= clamp(abs_logvar / Float32(cfg.var_mag_high), 1f0, 4f0)
+        elseif abs_logvar < Float32(cfg.var_mag_low)
+            var_mag_weight *= clamp(Float32(cfg.var_mag_low) / max(abs_logvar, 1f-4), 1f0, 4f0)
+        end
+    end
+
+    return (; pred=pred_weight, var_dir=var_dir_weight, var_mag=var_mag_weight)
+end
+
+function update_loss_ema(ema, internals; alpha::Float32=0.05f0)
+    one_minus = 1f0 - alpha
+    return (
+        recon=one_minus * ema.recon + alpha * Float32(internals.recon),
+        pred=one_minus * ema.pred + alpha * Float32(internals.pred),
+        var_dir=one_minus * ema.var_dir + alpha * Float32(internals.var_dir),
+        var_mag=one_minus * ema.var_mag + alpha * Float32(internals.var_mag),
+        abs_logvar=one_minus * ema.abs_logvar + alpha * Float32(internals.abs_logvar),
+    )
+end
+
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0, var_dir_weight::Float32=0f0, var_mag_weight::Float32=0f0, var_mag_low::Float32=0.2f0, var_mag_high::Float32=3.5f0, teacher_forcing::Bool=false)
     out, st_new = model(x_batch, ps, st; teacher_forcing=teacher_forcing)
     y_pred, mu, logvar, z, z_pred = out.logits, out.mu, out.logvar, out.z, out.z_pred
     
@@ -547,42 +682,53 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, start_id::In
     den = sum(weights)
     recon_loss = num / max(den, 1f0)
 
-    # 2. KL Divergence Loss
-    kl_per_element = -0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- exp.(logvar))
-    # Sum over dim, mean over batch
-    kl_per_dim = mean(sum(kl_per_element; dims=1)) # Scaler: average KL per sample
-    kl_loss = kl_per_dim
+    kl_loss = zero(recon_loss)
+    pred_loss = zero(recon_loss)
+    var_dir_loss = zero(recon_loss)
 
-    # --- Monitoring Metrics (No Gradient) ---
+    kl_per_element = -0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- exp.(logvar))
+    kl_per_dim = mean(sum(kl_per_element; dims=1))
+    kl_loss = kl_per_dim
     var = exp.(logvar)
     mean_var = mean(var)
     
     kl_dim_vector = mean(-0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- var); dims=(2,3)) 
-    # The dimensions of logvar are [Dim, N_capsules, Batch] -> dims=(2,3) averages over N and B
-    
-    # 3. Latent Predictive Loss (JEPA)
-    # Task: z_pred[t] should predict z[t+1]
-    # z: [Dim, Lcap, B]
-    # Shift: z_target = z[:, 2:end, :]
-    #        z_pred_in = z_pred[:, 1:end-1, :]
-    # If Lcap=1, we can't do this loss (need sequence).
     if Lcap > 1
-        z_target = Zygote.dropgrad(z[:, 2:end, :]) # Stop gradient on target
+        z_target = Zygote.dropgrad(z[:, 2:end, :])
         z_p = z_pred[:, 1:end-1, :]
         
         diff = z_p .- z_target
-        # Normalize by dimension (mean instead of sum) to keep loss scale independent of dim
-        # and comparable to reconstruction loss.
         pred_loss = mean(mean(abs2, diff; dims=1))
+
+        eos_mask_tokens = (y_batch_pad .== eos_id)
+        eos_mask_3d = reshape(eos_mask_tokens, K, Lcap, B)
+        capsule_has_eos = dropdims(any(eos_mask_3d; dims=1); dims=1)
+        valid_transition = .!(capsule_has_eos[1:end-1, :])
+
+        logvar_src = logvar[:, 1:end-1, :]
+        logvar_tgt = Zygote.dropgrad(logvar[:, 2:end, :])
+        src_normsq = sum(abs2, logvar_src; dims=1) .+ 1f-6
+        tgt_normsq = sum(abs2, logvar_tgt; dims=1) .+ 1f-6
+        dot_product = sum(logvar_src .* logvar_tgt; dims=1)
+        cos_sim = dot_product ./ sqrt.(src_normsq .* tgt_normsq)
+        per_transition_loss = 1f0 .- cos_sim
+        masked_loss = per_transition_loss .* reshape(Float32.(valid_transition), 1, Lcap - 1, B)
+        num_valid = sum(valid_transition)
+        var_dir_loss = sum(masked_loss) / max(Float32(num_valid), 1f0)
     end
 
-    total_loss = recon_loss + kl_weight * kl_loss + pred_weight * pred_loss
+    abs_logvar = abs.(logvar)
+    high_penalty = NNlib.relu.(abs_logvar .- var_mag_high)
+    low_penalty = NNlib.relu.(var_mag_low .- abs_logvar)
+    var_mag_loss = mean(abs2, high_penalty) + mean(abs2, low_penalty)
+
+    total_loss = recon_loss + kl_weight * kl_loss + pred_weight * pred_loss + var_dir_weight * var_dir_loss + var_mag_weight * var_mag_loss
     
-    # metrics
     z_mean_val = mean(mu)
     z_std_val = mean(exp.(0.5f0 .* logvar))
+    abs_logvar_mean = mean(abs_logvar)
 
-    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss, var=mean_var, z_mean=z_mean_val, z_std=z_std_val, kl_dim=Zygote.dropgrad(kl_dim_vector))
+    return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss, var_dir=var_dir_loss, var_mag=var_mag_loss, var=mean_var, z_mean=z_mean_val, z_std=z_std_val, abs_logvar=abs_logvar_mean, kl_dim=Zygote.dropgrad(kl_dim_vector))
 end
 
 function select_device()
@@ -666,30 +812,49 @@ end
 
 # --- Stream Batch Iterator ---
 # Manages B parallel streams from the 1D token array
-struct StreamBatchIterator
+mutable struct StreamBatchIterator
     tokens::Vector{Int}
     resets::Vector{Bool}
     batch_size::Int
     seq_len::Int
     num_batches::Int
     offsets::Vector{Int}
+    segment_ends::Vector{Int}
+    positions::Vector{Int}
+    block_size::Int
+    eos_id::Int
+    pad_id::Int
     
-    function StreamBatchIterator(tokens, resets, batch_size, seq_len)
+    function StreamBatchIterator(tokens, resets, batch_size, seq_len, block_size, eos_id, pad_id)
         N = length(tokens)
-        # We divide the total data into B segments
         segment_len = N ÷ batch_size
         offsets = [ (b-1) * segment_len + 1 for b in 1:batch_size ]
-        # How many full batches can we make?
-        # Each batch consumes seq_len
-        # In each segment, we can fit segment_len ÷ seq_len batches
-        num_batches = segment_len ÷ seq_len
-        new(tokens, resets, batch_size, seq_len, num_batches, offsets)
+        segment_ends = [offsets[b] + segment_len - 1 for b in 1:batch_size]
+        positions = copy(offsets)
+
+        expanded_lengths = Vector{Int}(undef, batch_size)
+        for b in 1:batch_size
+            expanded = 0
+            for idx in offsets[b]:segment_ends[b]
+                expanded += 1
+                if tokens[idx] == eos_id
+                    rem = block_size - (expanded % block_size)
+                    expanded += rem == block_size ? 0 : rem
+                end
+            end
+            expanded_lengths[b] = expanded
+        end
+        num_batches = minimum(expanded_lengths) ÷ seq_len
+        new(tokens, resets, batch_size, seq_len, num_batches, offsets, segment_ends, positions, block_size, eos_id, pad_id)
     end
 end
 
 Base.length(it::StreamBatchIterator) = it.num_batches
 
 function Base.iterate(it::StreamBatchIterator, state=1)
+    if state == 1
+        it.positions .= it.offsets
+    end
     if state > it.num_batches
         return nothing
     end
@@ -703,17 +868,25 @@ function Base.iterate(it::StreamBatchIterator, state=1)
     
     curr_resets = falses(B)
     batch_ids = Matrix{Int}(undef, L, B)
+    fill!(batch_ids, it.pad_id)
     
     for b in 1:B
-        start_idx = it.offsets[b] + (state - 1) * L
-        end_idx = start_idx + L - 1
-        
-        # Copy tokens
-        batch_ids[:, b] .= view(it.tokens, start_idx:end_idx)
-        
-        # Check for resets in this range
-        if any(view(it.resets, start_idx:end_idx))
-            curr_resets[b] = true
+        out_pos = 1
+        while out_pos <= L
+            src_pos = it.positions[b]
+            if src_pos > it.segment_ends[b]
+                break
+            end
+            tok = it.tokens[src_pos]
+            rst = it.resets[src_pos]
+            it.positions[b] = src_pos + 1
+            batch_ids[out_pos, b] = tok
+            curr_resets[b] = curr_resets[b] || rst
+            if tok == it.eos_id
+                out_pos = ((out_pos - 1) ÷ it.block_size + 1) * it.block_size + 1
+            else
+                out_pos += 1
+            end
         end
     end
     
@@ -761,7 +934,7 @@ function train(cfg)
     println("Using device: $dev")
     flush(stdout)
 
-    data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab = load_data(cfg.data_file, cfg.meta_file)
+    data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab, meta_data = load_data(cfg.data_file, cfg.meta_file; meta_data_override=cfg.meta_data)
 
     N_total = 0
     if is_stream
@@ -954,17 +1127,18 @@ function train(cfg)
         opt_state = resume_opt_state |> dev
     end
 
-    start_id = eos_id
+    loss_ema = (recon=1f0, pred=1f0, var_dir=1f0, var_mag=1f0, abs_logvar=1f0)
 
     # Initialize Iterator
     seq_len = cfg.seq_len
+    block_size = max(getfield(model.encoder, :block_size), 1)
     
     local batches
     local num_batches_per_epoch
     local stream_iter
 
     if is_stream
-        stream_iter = StreamBatchIterator(data_content, reset_flags, cfg.batch_size, seq_len)
+        stream_iter = StreamBatchIterator(data_content, reset_flags, cfg.batch_size, seq_len, block_size, eos_id, pad_id)
         if cfg.max_batches > 0
             batches = Iterators.take(stream_iter, cfg.max_batches)
             num_batches_per_epoch = min(length(stream_iter), cfg.max_batches)
@@ -1001,7 +1175,14 @@ function train(cfg)
         total_loss = 0.0
         n_updates = 0
 
-        if !is_stream
+        if is_stream
+            stream_iter = StreamBatchIterator(data_content, reset_flags, cfg.batch_size, seq_len, block_size, eos_id, pad_id)
+            if cfg.max_batches > 0
+                batches = Iterators.take(stream_iter, cfg.max_batches)
+            else
+                batches = stream_iter
+            end
+        else
             batches = make_batches_impl(data_content, is_stream, is_bucketed, cfg.batch_size, rng)
             if cfg.max_batches > 0
                 batches = batches[1:min(length(batches), cfg.max_batches)]
@@ -1026,13 +1207,14 @@ function train(cfg)
                 end
                 
                 x_cpu_raw = Matrix{Int}(tokens_cpu)
-                reset_mask = falses(size(x_cpu_raw, 2)) # No resets for bucketed
+                reset_mask = trues(size(x_cpu_raw, 2))
             end
 
             # Update LR
             target_lr = get_target_lr(cfg.lr)
             current_lr = get_lr(train_step + 1, warmup_steps, target_lr, total_steps)
             Optimisers.adjust!(opt_state, current_lr)
+            loss_weights = compute_adaptive_loss_weights(cfg, train_step, total_steps, loss_ema)
 
             # --- State Reset Logic ---
             apply_reset!(st, reset_mask)
@@ -1041,9 +1223,28 @@ function train(cfg)
             y_batch = x_batch # AutoEncoder target
 
             # Gradient
-            (loss, st_new, internals), back = Zygote.pullback(
-                p -> compute_loss(model, p, st, x_batch, y_batch; pad_id=pad_id, start_id=start_id, kl_weight=Float32(cfg.kl_weight), pred_weight=Float32(cfg.pred_weight), teacher_forcing=cfg.teacher_forcing), ps
-            )
+            st_holder = Ref{Any}(nothing)
+            internals_holder = Ref{Any}(nothing)
+            loss, grad_tuple = Zygote.withgradient(ps) do p
+                l, st_tmp, internals_tmp = compute_loss(
+                    model, p, st, x_batch, y_batch;
+                    pad_id=pad_id,
+                    eos_id=eos_id,
+                    kl_weight=Float32(cfg.kl_weight),
+                    pred_weight=loss_weights.pred,
+                    var_dir_weight=loss_weights.var_dir,
+                    var_mag_weight=loss_weights.var_mag,
+                    var_mag_low=Float32(cfg.var_mag_low),
+                    var_mag_high=Float32(cfg.var_mag_high),
+                    teacher_forcing=cfg.teacher_forcing,
+                )
+                st_holder[] = st_tmp
+                internals_holder[] = internals_tmp
+                return l
+            end
+            st_new = st_holder[]
+            internals = internals_holder[]
+            grads = grad_tuple[1]
 
             loss_val = Float32(loss)
             
@@ -1069,7 +1270,6 @@ function train(cfg)
                 end
             end
 
-            grads = back((one(loss), nothing, nothing))[1]
             grads, grad_norm, grad_scale = clip_grads(grads, Float32(cfg.grad_clip_norm))
             if grad_scale < 1f0 && (i % 50 == 0 || grad_scale < 0.2f0)
                 @printf "GradClip Epoch %d Step %d | norm=%.4f scale=%.6f\n" epoch i grad_norm grad_scale
@@ -1080,10 +1280,11 @@ function train(cfg)
             total_loss += loss_val
             n_updates += 1
             train_step += 1
+            loss_ema = update_loss_ema(loss_ema, internals)
 
             if i % 50 == 0
                 au = count(internals.kl_dim .> 0.01f0)
-                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | KL: %.4f | Pred: %.4f) | Var: %.4f | z_μ: %.4f | z_σ: %.4f | AU: %d | |g|: %.4f | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.recon internals.kl internals.pred internals.var internals.z_mean internals.z_std au grad_norm current_lr
+                @printf "Epoch %d [%d/%d] Loss: %.4f (Recon: %.4f | Pred: %.4f | VarDir: %.4f | VarMag: %.4f | KL: %.4f) | w[p=%.3f vd=%.3f vm=%.3f] | |logvar|: %.4f | Var: %.4f | z_μ: %.4f | z_σ: %.4f | AU: %d | |g|: %.4f | LR: %.2e\n" epoch i num_batches_per_epoch loss_val internals.recon internals.pred internals.var_dir internals.var_mag internals.kl loss_weights.pred loss_weights.var_dir loss_weights.var_mag internals.abs_logvar internals.var internals.z_mean internals.z_std au grad_norm current_lr
             end
 
             if cfg.save_every > 0 && (i % cfg.save_every == 0)
@@ -1096,6 +1297,8 @@ function train(cfg)
                     step=i,
                     train_step=train_step,
                     mamba_d_state=cfg.mamba_d_state,
+                    config=cfg,
+                    meta_data=meta_data,
                 )
             end
         end
@@ -1114,13 +1317,15 @@ function train(cfg)
             step=0,
             train_step=train_step,
             mamba_d_state=cfg.mamba_d_state,
+            config=cfg,
+            meta_data=meta_data,
         )
     end
 end
 
 
 function inspect_data(cfg)
-    data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab = load_data(cfg.data_file, cfg.meta_file)
+    data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, mask_id, vocab, _ = load_data(cfg.data_file, cfg.meta_file)
 
     N_total = 0
     if is_bucketed
@@ -1168,6 +1373,10 @@ function train_stage1(args::Vector{String})
         println("  --dim <int>               Model dimension")
         println("  --mamba-d-state <int>     Mamba d_state (default: $MAMBA_D_STATE)")
         println("  --warmup-steps <int>      Warmup steps (default: $WARMUP_STEPS)")
+        println("  --pred-weight <float>     Base prediction loss weight")
+        println("  --var-dir-weight <float>  Base variance direction loss weight")
+        println("  --var-mag-weight <float>  Base variance magnitude loss weight")
+        println("  --auto-loss-balance <0|1> Enable adaptive loss balancing")
         println("  --seq-len <int>           Stream chunk length (default: $SEQ_LEN)")
         println("  --teacher-forcing         Enable teacher forcing")
         println("  --inspect-data            Inspect data instead of training")

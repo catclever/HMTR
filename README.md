@@ -45,6 +45,58 @@ Available parameters when running `hmtr.jl data`:
    julia --project=. hmtr.jl data --tokenizer-name bert-base-uncased --max-docs 100
    ```
 
+## Stage 1 训练参数 / Stage 1 Training Parameters
+
+运行 `hmtr.jl train_stage1` 命令时可用的主要参数：
+Main parameters available when running `hmtr.jl train_stage1`:
+
+| 参数 / Parameter | 类型 / Type | 默认值 / Default | 说明 / Description |
+| :--- | :--- | :--- | :--- |
+| `--data-file` | String | `data/processed.jld2` | 处理后的训练数据文件路径。<br>Path to the processed training data file. |
+| `--meta-file` | String | (Auto) | 元数据文件路径。默认自动根据 data-file 推断。<br>Path to metadata file. Automatically inferred from data-file by default. |
+| `--checkpoint-dir` | String | `checkpoints` | 检查点保存目录。<br>Directory to save checkpoints. |
+| `--checkpoint-prefix` | String | `ckpt_stage1` | 检查点文件名前缀。<br>Prefix for checkpoint filenames. |
+| `--epochs` | Int | 5 | 训练轮数。<br>Number of training epochs. |
+| `--batch-size` | Int | 32 | 批次大小。<br>Batch size. |
+| `--lr` | Float | 1e-3 | 学习率。<br>Learning rate. |
+| `--dim` | Int | 256 | 模型维度。<br>Model dimension. |
+| `--mamba-d-state` | Int | 16 | Mamba 状态维度。<br>Mamba state dimension. |
+| `--seq-len` | Int | 1024 | 序列长度。<br>Sequence length. |
+| `--dtype` | String | `fp32` | 全局数据类型 (fp32, fp16, bf16)。<br>Global data type (fp32, fp16, bf16). |
+| `--warmup-steps` | Int | 500 | 学习率预热步数。<br>Learning rate warmup steps. |
+| `--grad-clip-norm` | Float | 5.0 | 梯度裁剪范数。<br>Gradient clipping norm. |
+| `--kl-weight` | Float | 0.0 | KL 散度损失权重。<br>KL divergence loss weight. |
+| `--pred-weight` | Float | 1.0 | 预测损失权重。<br>Prediction loss weight. |
+| `--var-dir-weight` | Float | 0.15 | 方差方向损失权重。<br>Variance direction loss weight. |
+| `--var-mag-weight` | Float | 0.01 | 方差幅度损失权重。<br>Variance magnitude loss weight. |
+| `--auto-loss-balance` | Bool | true | 是否自动平衡损失权重。<br>Whether to automatically balance loss weights. |
+| `--resume-ckpt` | String | "" | 恢复训练的检查点路径。<br>Path to checkpoint to resume training from. |
+| `--max-batches` | Int | 0 | 每轮最大训练批次数（0 表示全部）。<br>Max batches per epoch (0 means all). |
+| `--save-every` | Int | 0 | 每隔多少步保存一次检查点（0 表示仅每轮保存）。<br>Save checkpoint every N steps (0 means save only per epoch). |
+| `--loss-spike-threshold` | Float | 10.0 | 损失突增阈值。<br>Loss spike threshold. |
+| `--skip-on-spike` | Bool | true | 损失突增时是否跳过更新。<br>Whether to skip update on loss spike. |
+| `--teacher-forcing` | Bool | false | 是否使用 Teacher Forcing。<br>Whether to use Teacher Forcing. |
+| `--inspect-data` | Bool | false | 是否在训练前检查数据样本。<br>Whether to inspect data samples before training. |
+| `--inspect-n` | Int | 3 | 检查数据样本的数量。<br>Number of data samples to inspect. |
+| `--inspect-seed` | Int | 42 | 检查数据样本的随机种子。<br>Random seed for data inspection. |
+| `--pretrain-emb-file` | String | "" | 预训练 Embeddings 文件路径。<br>Path to pretrained embeddings file. |
+| `--add-timestamp` | Bool | true | 是否在检查点文件名中添加时间戳。<br>Whether to add timestamp to checkpoint filenames. |
+| `--encoder-dtype` | String | (global) | Encoder 特定数据类型。<br>Encoder specific data type. |
+| `--norm-dtype` | String | (global) | Normalization 层特定数据类型。<br>Normalization layer specific data type. |
+| `--decoder-dtype` | String | (global) | Decoder 特定数据类型。<br>Decoder specific data type. |
+| `--resume-meta-file` | String | (Auto) | 恢复训练时的元数据文件路径（默认自动推断）。<br>Metadata file path when resuming (auto-inferred by default). |
+| `--var-mag-low` | Float | 0.2 | 方差幅度惩罚的下限阈值。<br>Lower threshold for variance magnitude penalty. |
+| `--var-mag-high` | Float | 3.5 | 方差幅度惩罚的上限阈值。<br>Upper threshold for variance magnitude penalty. |
+| `--target-pred-ratio` | Float | 0.25 | 目标预测损失占比（自动平衡用）。<br>Target prediction loss ratio (for auto balance). |
+| `--target-var-dir-ratio` | Float | 0.10 | 目标方差方向损失占比（自动平衡用）。<br>Target variance direction loss ratio (for auto balance). |
+| `--pred-warmup-frac` | Float | 0.10 | 预测损失预热步数比例（0.0-1.0）。<br>Prediction loss warmup fraction (0.0-1.0). |
+| `--var-dir-start-frac` | Float | 0.10 | 方差方向损失开始预热的比例。<br>Fraction of steps before starting variance direction loss warmup. |
+| `--var-dir-full-frac` | Float | 0.40 | 方差方向损失完成预热（达到全权重）的比例。<br>Fraction of steps when variance direction loss reaches full weight. |
+| `--pred-decay-start-frac` | Float | 0.75 | 预测损失开始衰减的比例。<br>Fraction of steps when prediction loss starts decaying. |
+| `--pred-decay-end-scale` | Float | 0.60 | 预测损失衰减结束时的缩放比例。<br>Scale factor for prediction loss at the end of decay. |
+
+*(更多高级参数请参考 `src/train_stage1.jl` 源码 / For more advanced parameters, please refer to `src/train_stage1.jl` source code)*
+
 ## 快速开始 / Quick Start
 1. **环境准备 / Setup**:
    安装 Julia 并初始化依赖：
