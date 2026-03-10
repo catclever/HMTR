@@ -12,7 +12,7 @@ using Dates
 using Unicode
 using ..Utils
 
-export data_prep
+export data_prep, encode_text_to_seq
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 const DEFAULT_DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
@@ -165,6 +165,18 @@ function encode_chars(s::String, char_map, unk_id::Int)
         i += 1
     end
     return out
+end
+
+function encode_text_to_seq(text::String, meta; preserve_width::Bool=false)
+    params = meta.params
+    char_map = meta.char_map
+    
+    s = normalize_text(text; preserve_width=preserve_width)
+    ids = encode_chars(s, char_map, params["UNK"])
+    
+    # Pad to block_size if needed, but for inference we just need batch dim
+    # Here we just return [L, 1] matrix
+    return reshape(ids, :, 1)
 end
 
 function process_data_char_stream(texts, output_file::AbstractString, meta_file::AbstractString, char_vocab_docs::Int, paragraph_eos::Bool, base_meta_file::AbstractString=""; preserve_width::Bool=false)

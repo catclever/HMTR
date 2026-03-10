@@ -10,6 +10,7 @@ using Statistics
 using Unicode
 using ..Utils
 using ..Model
+using ..Data
 
 export infer_stage1, infer_stage2
 
@@ -26,6 +27,7 @@ const FORCE_CPU = parse(Int, get(ENV, "FORCE_CPU", "0"))
 const INTERACTIVE = parse(Int, get(ENV, "INTERACTIVE", "0"))
 const SAMPLE = parse(Int, get(ENV, "SAMPLE", "0"))
 const PREDICT = parse(Int, get(ENV, "PREDICT", "0"))
+const PRESERVE_WIDTH = parse(Int, get(ENV, "PRESERVE_WIDTH", "0"))
 
 function resolve_config(cli::Dict{Symbol, Any})
     data_file = get(cli, :data_file, DATA_FILE)
@@ -68,17 +70,20 @@ function resolve_config(cli::Dict{Symbol, Any})
     interactive_raw = string(get(cli, :interactive, INTERACTIVE))
     sample_raw = string(get(cli, :sample, SAMPLE))
     predict_raw = string(get(cli, :predict, PREDICT))
+    preserve_width_raw = string(get(cli, :preserve_width, PRESERVE_WIDTH))
+    
     show_ids = show_ids_raw == "true" || show_ids_raw == "1"
     force_cpu = force_cpu_raw == "true" || force_cpu_raw == "1"
     interactive = interactive_raw == "true" || interactive_raw == "1"
     sample = sample_raw == "true" || sample_raw == "1"
     predict = predict_raw == "true" || predict_raw == "1"
+    preserve_width = preserve_width_raw == "true" || preserve_width_raw == "1"
 
     if isempty(text) && !interactive
         error("--text is required unless --interactive is enabled")
     end
 
-    return (; data_file, meta_file, checkpoint_file, text, show_ids, force_cpu, interactive, sample, predict)
+    return (; data_file, meta_file, checkpoint_file, text, show_ids, force_cpu, interactive, sample, predict, preserve_width)
 end
 
 function resolve_config_stage2(cli::Dict{Symbol, Any})
@@ -199,17 +204,8 @@ function load_meta(data_file::AbstractString, meta_file::AbstractString)
     return (; block_size, vocab_size, pad_id, eos_id, unk_id, char_map=char_map2, id_to_char, vocab)
 end
 
-normalize_text(x) = x === missing ? "" : normalize_text(String(x))
-
-function normalize_text(s::String)
-    s = Unicode.normalize(s, :NFKC)
-    s = replace(s, '\r' => '\n')
-    s = replace(s, r"[^\S\n]+" => " ")
-    return s
-end
-
-function encode_text_to_blocks(text::AbstractString, meta)
-    s = normalize_text(text)
+function encode_text_to_blocks(text::AbstractString, meta; preserve_width::Bool=false)
+    s = Data.normalize_text(text; preserve_width=preserve_width)
     ids = Vector{Int}()
     if !isempty(meta.char_map)
         for c in s
@@ -234,8 +230,8 @@ function encode_text_to_blocks(text::AbstractString, meta)
     return x
 end
 
-function encode_text_to_seq(text::AbstractString, meta)
-    s = normalize_text(text)
+function encode_text_to_seq(text::AbstractString, meta; preserve_width::Bool=false)
+    s = Data.normalize_text(text; preserve_width=preserve_width)
     ids = Vector{Int}()
     if !isempty(meta.char_map)
         for c in s
@@ -343,8 +339,8 @@ function greedy_decode_capsules(decoder, capsules, ps_dec, st_dec, meta, dev, cp
     return logits_to_ids(final_logits |> cpu)
 end
 
-function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; show_ids::Bool, sample::Bool, predict::Bool)
-    x = encode_text_to_seq(text, meta)
+function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; show_ids::Bool, sample::Bool, predict::Bool, preserve_width::Bool=false)
+    x = encode_text_to_seq(text, meta; preserve_width=preserve_width)
     x_dev = x |> dev
 
     capsules, _st_enc = model.encoder(x_dev, ps.encoder, st.encoder)
@@ -365,13 +361,27 @@ function infer_once(text::AbstractString, model, ps, st, meta, dev, cpu, rng; sh
     if predict
         z_pred, _st_pred = model.predictor(capsules_norm, ps.predictor, st.predictor)
         if size(z_pred, 2) > 1
+            # Predict "next" capsule in sequence (reconstruction check)
             z_next = @view z_pred[:, 1:end-1, :]
             pred_next = greedy_decode_capsules(model.decoder, z_next, ps.decoder, st.decoder, meta, dev, cpu)
             pred_next = stop_after_eos(pred_next, meta.eos_id)
             pred_next_text = decode_ids(vec(pred_next), meta)
-            println("PredNext: ", pred_next_text)
+            println("PredNext (internal): ", pred_next_text)
+
+            # Predict "future" capsule (after end)
+            z_future = @view z_pred[:, end:end, :]
+            pred_future = greedy_decode_capsules(model.decoder, z_future, ps.decoder, st.decoder, meta, dev, cpu)
+            pred_future = stop_after_eos(pred_future, meta.eos_id)
+            pred_future_text = decode_ids(vec(pred_future), meta)
+            println("PredFuture (extrapolation): ", pred_future_text)
         else
-            println("PredNext: ")
+            # Only one capsule, so z_pred[1] is the future prediction
+            z_future = z_pred
+            pred_future = greedy_decode_capsules(model.decoder, z_future, ps.decoder, st.decoder, meta, dev, cpu)
+            pred_future = stop_after_eos(pred_future, meta.eos_id)
+            pred_future_text = decode_ids(vec(pred_future), meta)
+            println("PredNext: ", pred_future_text)
+            println("PredFuture (extrapolation): ", pred_future_text)
         end
     end
 
@@ -543,12 +553,12 @@ function infer(cfg)
             if isempty(s) || s == ":q" || s == "quit" || s == "exit"
                 break
             end
-            infer_once(s, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, predict=cfg.predict)
+            infer_once(s, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, predict=cfg.predict, preserve_width=cfg.preserve_width)
         end
         return
     end
 
-    infer_once(cfg.text, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, predict=cfg.predict)
+    infer_once(cfg.text, model, ps, st, meta, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, predict=cfg.predict, preserve_width=cfg.preserve_width)
     return
 end
 

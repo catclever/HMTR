@@ -7,8 +7,8 @@ using HMTR
 # Usage: include("train_repl.jl")
 
 args = [
-    "--data-file", "/home/HMTR/data/processed_stream_char_20260218_111813.jld2",
-    "--meta-file", "/home/HMTR/data/processed_stream_char_20260218_111813_meta.jld2",
+    "--data-file", "/home/HMTR/data/processed_preserved_width.jld2",
+    "--meta-file", "/home/HMTR/data/processed_preserved_width_meta.jld2",
     "--checkpoint-dir", "/home/HMTR/checkpoints",
     "--checkpoint-prefix", "ckpt_stage1_opt",
     "--epochs", "5",
