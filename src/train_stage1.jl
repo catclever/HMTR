@@ -686,13 +686,15 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int,
     pred_loss = zero(recon_loss)
     var_dir_loss = zero(recon_loss)
 
-    kl_per_element = -0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- exp.(logvar))
+    # Clamp logvar to prevent exp(logvar) from exploding
+    logvar_clamped = clamp.(logvar, -10f0, 10f0)
+    kl_per_element = -0.5f0 .* (1f0 .+ logvar_clamped .- abs2.(mu) .- exp.(logvar_clamped))
     kl_per_dim = mean(sum(kl_per_element; dims=1))
     kl_loss = kl_per_dim
-    var = exp.(logvar)
+    var = exp.(logvar_clamped)
     mean_var = mean(var)
     
-    kl_dim_vector = mean(-0.5f0 .* (1f0 .+ logvar .- abs2.(mu) .- var); dims=(2,3)) 
+    kl_dim_vector = mean(-0.5f0 .* (1f0 .+ logvar_clamped .- abs2.(mu) .- var); dims=(2,3)) 
     if Lcap > 1
         z_target = Zygote.dropgrad(z[:, 2:end, :])
         z_p = z_pred[:, 1:end-1, :]
@@ -717,7 +719,7 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int,
         var_dir_loss = sum(masked_loss) / max(Float32(num_valid), 1f0)
     end
 
-    abs_logvar = abs.(logvar)
+    abs_logvar = abs.(logvar_clamped)
     high_penalty = NNlib.relu.(abs_logvar .- var_mag_high)
     low_penalty = NNlib.relu.(var_mag_low .- abs_logvar)
     var_mag_loss = mean(abs2, high_penalty) + mean(abs2, low_penalty)
@@ -725,7 +727,7 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int,
     total_loss = recon_loss + kl_weight * kl_loss + pred_weight * pred_loss + var_dir_weight * var_dir_loss + var_mag_weight * var_mag_loss
     
     z_mean_val = mean(mu)
-    z_std_val = mean(exp.(0.5f0 .* logvar))
+    z_std_val = mean(exp.(0.5f0 .* logvar_clamped))
     abs_logvar_mean = mean(abs_logvar)
 
     return total_loss, st_new, (; recon=recon_loss, kl=kl_loss, pred=pred_loss, var_dir=var_dir_loss, var_mag=var_mag_loss, var=mean_var, z_mean=z_mean_val, z_std=z_std_val, abs_logvar=abs_logvar_mean, kl_dim=Zygote.dropgrad(kl_dim_vector))
