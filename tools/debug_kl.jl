@@ -1,5 +1,5 @@
 using Lux, JLD2, CUDA, Statistics, Random
-include("src/HMTR.jl")
+include("../src/HMTR.jl")
 using .HMTR
 using .HMTR.Model: HMTR_Stage1_AutoEncoder
 using .HMTR.Data: encode_text_to_seq

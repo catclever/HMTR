@@ -16,7 +16,7 @@ using ..VEModel
 
 export train_stage1
 
-const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
+const PROJECT_ROOT = normpath(joinpath(@__DIR__, "../.."))
 const DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
 const DATA_FILE = get(ENV, "DATA_FILE", joinpath(DATA_DIR, "processed.jld2"))
 const META_FILE = get(ENV, "META_FILE", "")
@@ -116,6 +116,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     inspect_n = parse(Int, string(get(cli, :inspect_n, INSPECT_N)))
     warmup_steps = parse(Int, string(get(cli, :warmup_steps, WARMUP_STEPS)))
     teacher_forcing = parse_bool(:teacher_forcing, TEACHER_FORCING)
+    use_parallel = parse_bool(:use_parallel, 0)
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
     encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
@@ -191,6 +192,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         decoder_dtype,
         warmup_steps,
         teacher_forcing,
+        use_parallel,
     )
 end
 
@@ -586,7 +588,7 @@ function train(cfg)
     Random.seed!(rng, 42)
 
     # Initialize model. Block size is passed as dummy 0. MambaCompressor doesn't strictly need it if not using stride/pooling logic dependent on it.
-    model = VE_Stage1_AutoEncoder(vocab_size, cfg.dim; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state)
+    model = VE_Stage1_AutoEncoder(vocab_size, cfg.dim; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state, use_parallel=cfg.use_parallel)
     ps0, st0 = Lux.setup(rng, model)
     ps = ps0
     st = st0

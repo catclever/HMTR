@@ -1,6 +1,6 @@
 using Pkg
-Pkg.activate(".")
-include("src/HMTR.jl")
+Pkg.activate("../..")
+include("../../src/HMTR.jl")
 using .HMTR
 using Dates
 

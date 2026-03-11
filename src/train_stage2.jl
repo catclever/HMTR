@@ -85,6 +85,7 @@ function resolve_config(cli::Dict{Symbol, Any})
     seq_len = parse(Int, string(get(cli, :seq_len, SEQ_LEN)))
 
     skip_on_spike = haskey(cli, :skip_on_spike) ? string(get(cli, :skip_on_spike, "0")) in ("true", "1") : parse_bool("SKIP_ON_SPIKE", SKIP_ON_SPIKE)
+    use_parallel = haskey(cli, :use_parallel) ? string(get(cli, :use_parallel, "0")) in ("true", "1") : false
     force_cpu = string(get(cli, :force_cpu, FORCE_CPU)) in ("true", "1")
     add_timestamp = haskey(cli, :add_timestamp) ? string(get(cli, :add_timestamp, "1")) in ("true", "1") : string(get(ENV, "ADD_TIMESTAMP", ADD_TIMESTAMP)) in ("true", "1")
 
@@ -108,7 +109,7 @@ function resolve_config(cli::Dict{Symbol, Any})
     k_drop_min_raw = parse(Int, string(get(cli, :k_drop_min, K_DROP_MIN)))
     k_drop_min = max(1, min(k_drop_min_raw, k_streams))
 
-    return (; data_file, meta_file, checkpoint_dir, checkpoint_prefix, stage1_ckpt, resume_ckpt, epochs, batch_size, lr, max_batches, save_every, warmup_steps, k_streams, heads, num_layers, block_size, seq_len, skip_on_spike, force_cpu, grad_clip_norm, loss_spike_threshold, k_drop_threshold, k_drop_min)
+    return (; data_file, meta_file, checkpoint_dir, checkpoint_prefix, stage1_ckpt, resume_ckpt, epochs, batch_size, lr, max_batches, save_every, warmup_steps, k_streams, heads, num_layers, block_size, seq_len, skip_on_spike, force_cpu, grad_clip_norm, loss_spike_threshold, k_drop_threshold, k_drop_min, use_parallel)
 end
 
 function select_device(force_cpu::Bool)
@@ -168,7 +169,7 @@ function load_stage1(cfg, vocab_size::Int, pad_id::Int, eos_id::Int)
         ds = infer_mamba_d_state_from_ps(ps, dim)
         ds === nothing ? 16 : Int(ds)
     end
-    model = HMTR_Stage1_AutoEncoder(vocab_size, dim; block_size=cfg.block_size, pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
+    model = HMTR_Stage1_AutoEncoder(vocab_size, dim; block_size=cfg.block_size, pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state, use_parallel=cfg.use_parallel)
     rng = Random.default_rng()
     Random.seed!(rng, 42)
     ps0, st0 = Lux.setup(rng, model)

@@ -12,7 +12,7 @@ using ..VEModel
 
 export infer_stage1
 
-const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
+const PROJECT_ROOT = normpath(joinpath(@__DIR__, "../.."))
 const DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
 const DATA_FILE = get(ENV, "DATA_FILE", joinpath(DATA_DIR, "processed.jld2"))
 const META_FILE = get(ENV, "META_FILE", "")

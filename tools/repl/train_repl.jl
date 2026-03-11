@@ -1,6 +1,7 @@
 using Pkg
-Pkg.activate(".")
-using HMTR
+Pkg.activate("../..")
+include("../../src/HMTR.jl")
+using .HMTR
 
 # Optimized Training Command for REPL
 # Includes new parameters for variance regularization and loss scheduling

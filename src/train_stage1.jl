@@ -206,6 +206,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     var_mag_low = max(var_mag_low, 0.0)
     var_mag_high = max(var_mag_high, var_mag_low + 1e-6)
     teacher_forcing = parse_bool(:teacher_forcing, TEACHER_FORCING)
+    use_parallel = parse_bool(:use_parallel, 0)
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
     encoder_dtype = string(get(cli, :encoder_dtype, ENCODER_DTYPE))
@@ -294,6 +295,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         pred_decay_start_frac,
         pred_decay_end_scale,
         teacher_forcing,
+        use_parallel,
         seq_len,
         meta_data = ckpt_meta_data,
     )
@@ -957,7 +959,7 @@ function train(cfg)
     Random.seed!(rng, 42)
 
     # Initialize model
-    model = HMTR_Stage1_AutoEncoder(vocab_size, cfg.dim; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state)
+    model = HMTR_Stage1_AutoEncoder(vocab_size, cfg.dim; pad_id=pad_id, eos_id=eos_id, mamba_d_state=cfg.mamba_d_state, use_parallel=cfg.use_parallel)
     ps0, st0 = Lux.setup(rng, model)
     ps = ps0
     st = st0

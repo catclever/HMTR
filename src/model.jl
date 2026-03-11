@@ -14,6 +14,8 @@ export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentPredictor,
 
 hippo_A_diag(d_state::Int, ::Type{T}=Float32) where {T<:AbstractFloat} = -(T.(collect(1:d_state)))
 
+include("mamba_scan.jl")
+
 function reparameterize(μ, logvar; rng=Random.default_rng(), training=true)
     if !training
         return μ
@@ -91,12 +93,13 @@ struct SimplifiedMambaBlock{L1,L2,L3} <: Lux.AbstractLuxLayer
     # Hidden state dimension
     d_model::Int
     d_state::Int
+    use_parallel::Bool
 
     # Simple projections for B, C, Delta adaptation (simplified)
     adt_proj::L3
 end
 
-function SimplifiedMambaBlock(d_model::Int, d_state::Int=16)
+function SimplifiedMambaBlock(d_model::Int, d_state::Int=16; use_parallel::Bool=false)
     # Projects input to [x; z] (typical Mamba gated architecture)
     in_proj = Dense(d_model => d_model * 2)
     out_proj = Dense(d_model => d_model)
@@ -106,7 +109,7 @@ function SimplifiedMambaBlock(d_model::Int, d_state::Int=16)
     # dt (1), B (d_state), C (d_state)
     adt_proj = Dense(d_model => d_model + 2 * d_state)
 
-    return SimplifiedMambaBlock(in_proj, out_proj, d_model, d_state, adt_proj)
+    return SimplifiedMambaBlock(in_proj, out_proj, d_model, d_state, use_parallel, adt_proj)
 end
 
 Lux.initialparameters(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
@@ -124,92 +127,6 @@ Lux.initialstates(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
     h=nothing
 )
 
-function mamba_init_state(x, A, h_prev)
-    d_model, L, batch = size(x)
-    d_state = size(A, 2)
-    if h_prev isa AbstractArray && ndims(h_prev) == 3 &&
-       size(h_prev, 1) == d_model && size(h_prev, 2) == d_state && size(h_prev, 3) == batch
-        return copy(h_prev)
-    end
-    h0 = similar(x, d_model, d_state, batch)
-    fill!(h0, zero(eltype(h0)))
-    return h0
-end
-
-function mamba_scan(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing)
-    d_model, L, batch = size(x)
-    d_state = size(A, 2)
-    h = mamba_init_state(x, A, h_prev)
-
-    D2 = reshape(D, d_model, 1)
-    A2 = reshape(A, d_model, d_state, 1)
-
-    if L == 0
-        return similar(x, d_model, 0, batch), h
-    end
-    ys = similar(x, d_model, L, batch)
-
-    dt_min = 1f-4
-    dt_scale = 0.1f0
-    for t in 1:L
-        xt = view(x, :, t, :)
-        dt_val = NNlib.softplus.(view(dt_raw, :, t, :)) .* dt_scale .+ dt_min
-        dt = clamp.(dt_val, dt_min, 5f0)
-        Bt = view(B_raw, :, t, :)
-        Ct = view(C_raw, :, t, :)
-
-        dt3 = reshape(dt, d_model, 1, batch)
-        xt3 = reshape(xt, d_model, 1, batch)
-        B3 = reshape(Bt, 1, d_state, batch)
-        C3 = reshape(Ct, 1, d_state, batch)
-
-        decay = exp.(A2 .* dt3)
-        h .= h .* decay .+ (B3 .* dt3) .* xt3
-
-        y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
-        @views ys[:, t, :] .= y
-    end
-
-    return ys, h
-end
-
-function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing)
-    d_model, L, batch = size(x)
-    d_state = size(A, 2)
-    h = mamba_init_state(x, A, h_prev)
-
-    D2 = reshape(D, d_model, 1)
-    A2 = reshape(A, d_model, d_state, 1)
-
-    ys = similar(x, d_model, L, batch)
-    hs = similar(x, d_model, d_state, batch, L)
-
-    dt_min = 1f-4
-    dt_scale = 0.1f0
-    for t in 1:L
-        xt = @view x[:, t, :]
-        # Softplus is safe, but dt_scale * softplus can be large.
-        # Clamp dt to avoid exp(A * dt) exploding or vanishing too hard.
-        dt_val = NNlib.softplus.(@view dt_raw[:, t, :]) .* dt_scale .+ dt_min
-        dt = clamp.(dt_val, dt_min, 5f0)
-        Bt = @view B_raw[:, t, :]
-        Ct = @view C_raw[:, t, :]
-
-        dt3 = reshape(dt, d_model, 1, batch)
-        xt3 = reshape(xt, d_model, 1, batch)
-        B3 = reshape(Bt, 1, d_state, batch)
-        C3 = reshape(Ct, 1, d_state, batch)
-
-        decay = exp.(A2 .* dt3)
-        h .= h .* decay .+ (B3 .* dt3) .* xt3
-
-        y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
-        @views ys[:, t, :] .= y
-        @views hs[:, :, :, t] .= h
-    end
-
-    return ys, h, hs
-end
 
 function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D, h_prev)
     y, h_last, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev)
@@ -325,7 +242,7 @@ function (l::SimplifiedMambaBlock)(x, ps, st)
 
     h_prev = haskey(st, :h) ? st.h : nothing
     h_in = h_prev === nothing ? nothing : Zygote.dropgrad(h_prev)
-    y_scan, h_next = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D, h_in)
+    y_scan, h_next = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D, h_in; use_parallel=l.use_parallel)
     y = y_scan .* NNlib.swish.(z_branch)
 
     out = l.out_proj(y, ps.out_proj, st.out_proj)[1]
@@ -345,13 +262,13 @@ struct MambaCompressor{L<:Lux.AbstractLuxLayer, H1<:Lux.AbstractLuxLayer, H2<:Lu
     eos_id::Int
 end
 
-function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
+function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16, use_parallel::Bool=false)
     # 2 layers of "Simplified Mamba"
     layers = Chain(
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state)
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel)
     )
     # VAE Heads: Separate projections for mu and logvar
     mu_head = Dense(dim => dim)
@@ -819,14 +736,14 @@ struct MambaDecoder{E,L,P} <: Lux.AbstractLuxLayer
     eos_id::Int
 end
 
-function MambaDecoder(vocab_size::Int, dim::Int; eos_id::Int=2, mamba_d_state::Int=16)
+function MambaDecoder(vocab_size::Int, dim::Int; eos_id::Int=2, mamba_d_state::Int=16, use_parallel::Bool=false)
     embedding = Embedding(vocab_size => dim)
     # Isomorphic to Encoder: 4 layers of SimplifiedMambaBlock
     layers = Chain(
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state)
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel)
     )
     proj = Dense(dim => vocab_size)
     return MambaDecoder(embedding, layers, proj, dim, eos_id)
@@ -929,8 +846,8 @@ struct HMTR_Stage1_AutoEncoder{E,N,P,D} <: Lux.AbstractLuxLayer
     decoder::D
 end
 
-function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
-    enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
+function HMTR_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16, use_parallel::Bool=false)
+    enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state, use_parallel=use_parallel)
     norm = FeatureLayerNorm(dim)
     pred = LatentPredictor(dim)
     dec = NanoDecoder(vocab_size, dim, block_size; eos_id=eos_id)

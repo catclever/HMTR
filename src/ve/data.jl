@@ -13,7 +13,7 @@ using ..Utils
 
 export ve_data_prep
 
-const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
+const PROJECT_ROOT = normpath(joinpath(@__DIR__, "../.."))
 const DEFAULT_DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
 const DEFAULT_PARQUET_FILE = get(ENV, "PARQUET_FILE", "")
 const DEFAULT_TOKENIZER_NAME = get(ENV, "TOKENIZER_NAME", "")

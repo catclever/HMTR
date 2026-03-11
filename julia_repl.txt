@@ -52,8 +52,8 @@ HMTR.main([
 
 HMTR.main([
     "train_stage1",
-    "--data-file", "/home/HMTR/data/processed_preserved_width.jld2",
-    "--meta-file", "/home/HMTR/data/processed_preserved_width_meta.jld2",
+    "--data-file", "/home/HMTR/data/processed_stream_char_mixed_wiki_full_1to1_preserve_width.jld2",
+    "--meta-file", "/home/HMTR/data/processed_stream_char_mixed_wiki_full_1to1_preserve_width_meta.jld2",
     "--checkpoint-dir", "/home/HMTR/checkpoints",
     "--checkpoint-prefix", "ckpt_pad_aware_stage1_stream_seq512",
     "--epochs", "2",

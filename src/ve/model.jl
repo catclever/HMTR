@@ -13,6 +13,8 @@ export FeatureLayerNorm, SimplifiedMambaBlock, MambaCompressor, LatentReasoner, 
 
 hippo_A_diag(d_state::Int, ::Type{T}=Float32) where {T<:AbstractFloat} = -(T.(collect(1:d_state)))
 
+include("../mamba_scan.jl")
+
 struct FeatureLayerNorm <: Lux.AbstractLuxLayer
     dim::Int
     epsilon::Float32
@@ -49,12 +51,13 @@ struct SimplifiedMambaBlock{L1,L2,L3} <: Lux.AbstractLuxLayer
     # Hidden state dimension
     d_model::Int
     d_state::Int
+    use_parallel::Bool
 
     # Simple projections for B, C, Delta adaptation (simplified)
     adt_proj::L3
 end
 
-function SimplifiedMambaBlock(d_model::Int, d_state::Int=16)
+function SimplifiedMambaBlock(d_model::Int, d_state::Int=16; use_parallel::Bool=false)
     # Projects input to [x; z] (typical Mamba gated architecture)
     in_proj = Dense(d_model => d_model * 2)
     out_proj = Dense(d_model => d_model)
@@ -64,7 +67,7 @@ function SimplifiedMambaBlock(d_model::Int, d_state::Int=16)
     # dt (1), B (d_state), C (d_state)
     adt_proj = Dense(d_model => d_model + 2 * d_state)
 
-    return SimplifiedMambaBlock(in_proj, out_proj, d_model, d_state, adt_proj)
+    return SimplifiedMambaBlock(in_proj, out_proj, d_model, d_state, use_parallel, adt_proj)
 end
 
 Lux.initialparameters(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
@@ -81,89 +84,15 @@ Lux.initialstates(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
     adt_proj=Lux.initialstates(rng, l.adt_proj)
 )
 
-# The scan function
-# x: [D, L, B]
-function mamba_scan(x, dt_raw, B_raw, C_raw, A, D)
-    d_model, L, batch = size(x)
-    d_state = size(A, 2)
-    h = similar(x, d_model, d_state, batch)
-    fill!(h, zero(eltype(h)))
 
-    D2 = reshape(D, d_model, 1)
-    A2 = reshape(A, d_model, d_state, 1)
-
-    if L == 0
-        return similar(x, d_model, 0, batch)
-    end
-    ys = similar(x, d_model, L, batch)
-
-    dt_min = 1f-4
-    dt_scale = 0.1f0
-    for t in 1:L
-        xt = view(x, :, t, :)
-        dt = NNlib.softplus.(view(dt_raw, :, t, :)) .* dt_scale .+ dt_min
-        Bt = view(B_raw, :, t, :)
-        Ct = view(C_raw, :, t, :)
-
-        dt3 = reshape(dt, d_model, 1, batch)
-        xt3 = reshape(xt, d_model, 1, batch)
-        B3 = reshape(Bt, 1, d_state, batch)
-        C3 = reshape(Ct, 1, d_state, batch)
-
-        decay = exp.(A2 .* dt3)
-        h = h .* decay .+ (B3 .* dt3) .* xt3
-
-        y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
-        @views ys[:, t, :] .= y
-    end
-
-    return ys
-end
-
-function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
-    d_model, L, batch = size(x)
-    d_state = size(A, 2)
-    h = similar(x, d_model, d_state, batch)
-    fill!(h, zero(eltype(h)))
-
-    D2 = reshape(D, d_model, 1)
-    A2 = reshape(A, d_model, d_state, 1)
-
-    ys = similar(x, d_model, L, batch)
-    hs = similar(x, d_model, d_state, batch, L)
-
-    dt_min = 1f-4
-    dt_scale = 0.1f0
-    for t in 1:L
-        xt = @view x[:, t, :]
-        dt = NNlib.softplus.(@view dt_raw[:, t, :]) .* dt_scale .+ dt_min
-        Bt = @view B_raw[:, t, :]
-        Ct = @view C_raw[:, t, :]
-
-        dt3 = reshape(dt, d_model, 1, batch)
-        xt3 = reshape(xt, d_model, 1, batch)
-        B3 = reshape(Bt, 1, d_state, batch)
-        C3 = reshape(Ct, 1, d_state, batch)
-
-        decay = exp.(A2 .* dt3)
-        h .= h .* decay .+ (B3 .* dt3) .* xt3
-
-        y = dropdims(sum(h .* C3; dims=2); dims=2) .+ (D2 .* xt)
-        @views ys[:, t, :] .= y
-        @views hs[:, :, :, t] .= h
-    end
-
-    return ys, hs
-end
-
-function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D)
-    y, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D)
+function ChainRulesCore.rrule(::typeof(mamba_scan_sequential), x, dt_raw, B_raw, C_raw, A, D, h_prev)
+    y, _, hs = mamba_scan_sequential_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev)
 
     function pullback(ȳ)
         if ȳ isa ChainRulesCore.AbstractZero
             return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
                 ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
-                ChainRulesCore.ZeroTangent())
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent())
         end
 
         d_model, L, batch = size(x)
@@ -238,7 +167,7 @@ function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, 
             gh .= gh .* decay
         end
 
-        return (ChainRulesCore.NoTangent(), dx, ddt_raw, dB_raw, dC_raw, dA, dD)
+        return (ChainRulesCore.NoTangent(), dx, ddt_raw, dB_raw, dC_raw, dA, dD, ChainRulesCore.ZeroTangent())
     end
 
     return y, pullback
@@ -257,7 +186,7 @@ function (l::SimplifiedMambaBlock)(x, ps, st)
     B_raw = @view adt[d+1:d+d_state, :, :]
     C_raw = @view adt[d+d_state+1:d+2d_state, :, :]
 
-    y_scan = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D)
+    y_scan = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D; use_parallel=l.use_parallel)
     y = y_scan .* NNlib.swish.(z_branch)
 
     out = l.out_proj(y, ps.out_proj, st.out_proj)[1]
@@ -275,13 +204,13 @@ struct MambaCompressor{L<:Lux.AbstractLuxLayer} <: Lux.AbstractLuxLayer
     eos_id::Int
 end
 
-function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
+function MambaCompressor(vocab_size::Int, dim::Int, block_size::Int=8; pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16, use_parallel::Bool=false)
     # 2 layers of "Simplified Mamba"
     layers = Chain(
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state)
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel)
     )
     return MambaCompressor(Embedding(vocab_size => dim), layers, block_size, dim, pad_id, eos_id)
 end
@@ -475,14 +404,14 @@ struct MambaDecoder{E,L,P} <: Lux.AbstractLuxLayer
     eos_id::Int
 end
 
-function MambaDecoder(vocab_size::Int, dim::Int; eos_id::Int=2, mamba_d_state::Int=16)
+function MambaDecoder(vocab_size::Int, dim::Int; eos_id::Int=2, mamba_d_state::Int=16, use_parallel::Bool=false)
     embedding = Embedding(vocab_size => dim)
     # Isomorphic to Encoder: 4 layers of SimplifiedMambaBlock
     layers = Chain(
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state),
-        SimplifiedMambaBlock(dim, mamba_d_state)
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel),
+        SimplifiedMambaBlock(dim, mamba_d_state; use_parallel=use_parallel)
     )
     proj = Dense(dim => vocab_size)
     return MambaDecoder(embedding, layers, proj, dim, eos_id)
@@ -584,11 +513,11 @@ struct VE_Stage1_AutoEncoder{E,N,D} <: Lux.AbstractLuxLayer
     decoder::D
 end
 
-function VE_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16)
+function VE_Stage1_AutoEncoder(vocab_size::Int, dim::Int=512; block_size::Int=8, pad_id::Int=1, eos_id::Int=2, mamba_d_state::Int=16, use_parallel::Bool=false)
     # Encoder: block_size isn't strictly enforced in forward but kept in struct. 
     # We remove block_size dependency for MambaCompressor's ctor logic if it was just for struct.
     # But MambaCompressor defined in code has block_size. We pass 0 or a dummy if not used for striding.
-    enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state)
+    enc = MambaCompressor(vocab_size, dim, block_size; pad_id=pad_id, eos_id=eos_id, mamba_d_state=mamba_d_state, use_parallel=use_parallel)
     norm = FeatureLayerNorm(dim)
     dec = NanoDecoder(vocab_size, dim, block_size; eos_id=eos_id)
     return VE_Stage1_AutoEncoder(enc, norm, dec)
