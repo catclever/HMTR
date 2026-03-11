@@ -129,7 +129,7 @@ Lux.initialstates(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
 
 
 function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D, h_prev)
-    y, h_last, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev)
+    y, h_last, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev, false)
 
     function pullback(ȳ_pair)
         if ȳ_pair isa ChainRulesCore.AbstractZero
@@ -227,6 +227,103 @@ function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, 
     return (y, h_last), pullback
 end
 
+function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D, h_prev, use_parallel::Bool)
+    y, h_last, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev, use_parallel)
+
+    function pullback(ȳ_pair)
+        if ȳ_pair isa ChainRulesCore.AbstractZero
+            return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent())
+        end
+
+        ȳ = (ȳ_pair isa Tuple || ȳ_pair isa ChainRulesCore.Tangent) ? ȳ_pair[1] : ȳ_pair
+        if ȳ isa ChainRulesCore.AbstractZero
+            return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(),
+                ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent())
+        end
+
+        d_model, L, batch = size(x)
+        d_state = size(A, 2)
+
+        dx = similar(x)
+        fill!(dx, zero(eltype(dx)))
+        ddt_raw = similar(dt_raw)
+        fill!(ddt_raw, zero(eltype(ddt_raw)))
+        dB_raw = similar(B_raw)
+        fill!(dB_raw, zero(eltype(dB_raw)))
+        dC_raw = similar(C_raw)
+        fill!(dC_raw, zero(eltype(dC_raw)))
+        dA = similar(A)
+        fill!(dA, zero(eltype(dA)))
+        dD = similar(D)
+        fill!(dD, zero(eltype(dD)))
+
+        D2 = reshape(D, d_model, 1)
+        A2 = reshape(A, d_model, d_state, 1)
+
+        h0 = mamba_init_state(x, A, h_prev)
+
+        gh = similar(h0)
+        fill!(gh, zero(eltype(gh)))
+        gdecay = similar(h0)
+        gudt = similar(x, d_model, batch)
+        gdt = similar(x, d_model, batch)
+
+        dt_min = 1f-4
+        dt_scale = 0.1f0
+
+        for t in L:-1:1
+            xt = x[:, t, :]
+            dt_raw_t = dt_raw[:, t, :]
+            Bt = B_raw[:, t, :]
+            Ct = C_raw[:, t, :]
+            dt_val = NNlib.softplus.(dt_raw_t) .* dt_scale .+ dt_min
+            dt = clamp.(dt_val, dt_min, 5f0)
+            dt_mask = (dt_val .>= dt_min) .& (dt_val .<= 5f0)
+
+            dt3 = reshape(dt, d_model, 1, batch)
+            xt3 = reshape(xt, d_model, 1, batch)
+            B3 = reshape(Bt, 1, d_state, batch)
+            C3 = reshape(Ct, 1, d_state, batch)
+
+            h_prev = t == 1 ? h0 : hs[:, :, :, t - 1]
+            h_t = hs[:, :, :, t]
+
+            decay = exp.(A2 .* dt3)
+
+            ȳt = ȳ[:, t, :]
+
+            gh .+= reshape(ȳt, d_model, 1, batch) .* C3
+
+            @views dC_raw[:, t, :] .+= dropdims(sum(h_t .* reshape(ȳt, d_model, 1, batch); dims=1); dims=1)
+            dx[:, t, :] .+= ȳt .* D2
+            dD .+= vec(dropdims(sum(ȳt .* xt; dims=2); dims=2))
+
+            gdecay .= gh .* h_prev
+
+            gudt .= dropdims(sum(gh .* (dt3 .* B3); dims=2); dims=2)
+            dx[:, t, :] .+= gudt
+
+            gdt .= dropdims(sum(gh .* (xt3 .* B3); dims=2); dims=2)
+            @views dB_raw[:, t, :] .+= dropdims(sum(gh .* (xt3 .* dt3); dims=1); dims=1)
+
+            gdt .+= dropdims(sum(gdecay .* (A2 .* decay); dims=2); dims=2)
+            dA .+= dropdims(sum(gdecay .* (reshape(dt, d_model, 1, batch) .* decay); dims=3); dims=3)
+
+            gdt_raw = gdt .* (dt_scale .* NNlib.sigmoid.(dt_raw_t))
+            ddt_raw[:, t, :] .+= gdt_raw .* dt_mask
+
+            gh .= gh .* decay
+        end
+
+        return (ChainRulesCore.NoTangent(), dx, ddt_raw, dB_raw, dC_raw, dA, dD, ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent())
+    end
+
+    return (y, h_last), pullback
+end
+
 function (l::SimplifiedMambaBlock)(x, ps, st)
     # x: [D, L, B]
     xz = l.in_proj(x, ps.in_proj, st.in_proj)[1]
@@ -242,7 +339,7 @@ function (l::SimplifiedMambaBlock)(x, ps, st)
 
     h_prev = haskey(st, :h) ? st.h : nothing
     h_in = h_prev === nothing ? nothing : Zygote.dropgrad(h_prev)
-    y_scan, h_next = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D, h_in; use_parallel=l.use_parallel)
+    y_scan, h_next = mamba_scan(x_branch, dt_raw, B_raw, C_raw, ps.A, ps.D, h_in, l.use_parallel)
     y = y_scan .* NNlib.swish.(z_branch)
 
     out = l.out_proj(y, ps.out_proj, st.out_proj)[1]

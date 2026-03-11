@@ -191,7 +191,7 @@ function mamba_scan_parallel(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing)
     return ys, h_last
 end
 
-function mamba_scan(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing; use_parallel::Bool=false)
+function mamba_scan(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing, use_parallel::Bool=false)
     if use_parallel
         return mamba_scan_parallel(x, dt_raw, B_raw, C_raw, A, D, h_prev)
     else
@@ -199,10 +199,89 @@ function mamba_scan(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing; use_parallel:
     end
 end
 
-function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing; use_parallel::Bool=false)
+function mamba_scan(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing; use_parallel::Bool=false)
+    return mamba_scan(x, dt_raw, B_raw, C_raw, A, D, h_prev, use_parallel)
+end
+
+function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing, use_parallel::Bool=false)
     if use_parallel
         return mamba_scan_parallel_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev)
     else
         return mamba_scan_sequential_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev)
     end
+end
+
+function mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing; use_parallel::Bool=false)
+    return mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev, use_parallel)
+end
+
+function ChainRulesCore.rrule(::typeof(parallel_associative_scan_log), log_a, u)
+    # Forward pass (no tracking, so mutation is fine)
+    S_final, log_P_final = parallel_associative_scan_log(log_a, u)
+    
+    function parallel_associative_scan_log_pullback(Δ)
+        if Δ isa ChainRulesCore.AbstractZero
+            return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(), ChainRulesCore.ZeroTangent())
+        end
+        
+        ΔS, ΔlogP = Δ
+        # Handle cases where one of the gradients is Zero
+        if ΔS isa ChainRulesCore.AbstractZero
+            ΔS = zeros(eltype(u), size(u))
+        end
+        if ΔlogP isa ChainRulesCore.AbstractZero
+            ΔlogP = zeros(eltype(log_a), size(log_a))
+        end
+        
+        # 1. Gradient w.r.t u (du)
+        # du is computed via reverse scan of ΔS.
+        # Reverse inputs along time dimension (dim 4)
+        ΔS_rev = reverse(ΔS, dims=4)
+        
+        # Prepare multipliers for reverse scan
+        # We need log_a shifted: [0, log_a[L], log_a[L-1], ..., log_a[2]]
+        # which corresponds to multipliers for reverse steps.
+        
+        log_a_rev = reverse(log_a, dims=4)
+        # Create shifted version with 0 padding at start
+        sz = collect(size(log_a))
+        sz[4] = 1
+        pad = zeros(eltype(log_a), Tuple(sz))
+        if CUDA.functional() && log_a isa CUDA.CuArray
+            pad = CUDA.zeros(eltype(log_a), Tuple(sz))
+        end
+        
+        # slice 1:L-1
+        slice = selectdim(log_a_rev, 4, 1:size(log_a, 4)-1)
+        shifted_log_a_rev = cat(pad, slice; dims=4)
+        
+        # Run reverse scan
+        # Note: The scan function expects (log_multiplier, value)
+        # We use the same parallel_associative_scan_log
+        du_rev, _ = parallel_associative_scan_log(shifted_log_a_rev, ΔS_rev)
+        
+        # Reverse back to get du
+        du = reverse(du_rev, dims=4)
+        
+        # 2. Gradient w.r.t log_a (dlog_a)
+        # Term 1: from S_final dependence
+        # dlog_a_t += du_t * S_{t-1} * exp(log_a_t)
+        
+        # S_{t-1} (shifted right)
+        slice_S = selectdim(S_final, 4, 1:size(S_final, 4)-1)
+        S_prev = cat(pad, slice_S; dims=4) # Same pad (zeros) works here
+        
+        dlog_a = du .* S_prev .* exp.(log_a)
+        
+        # Term 2: from log_P_final dependence
+        # log_P is cumsum(log_a). Gradient is reverse_cumsum(ΔlogP).
+        # reverse_cumsum(x) = reverse(cumsum(reverse(x)))
+        dlog_a_from_P = reverse(cumsum(reverse(ΔlogP, dims=4), dims=4), dims=4)
+        
+        dlog_a = dlog_a .+ dlog_a_from_P
+        
+        return (ChainRulesCore.NoTangent(), dlog_a, du)
+    end
+    
+    return (S_final, log_P_final), parallel_associative_scan_log_pullback
 end
