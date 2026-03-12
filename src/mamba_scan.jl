@@ -119,6 +119,77 @@ function scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride::Int, L::In
     return nothing
 end
 
+function reverse_lastdim_kernel!(out, inp, stride::Int, L::Int, total::Int)
+    lin = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if lin <= total
+        idx = ((lin - 1) % stride) + 1
+        t = ((lin - 1) ÷ stride) + 1
+        src_lin = idx + (L - t) * stride
+        out[lin] = inp[src_lin]
+    end
+    return nothing
+end
+
+function shift_right_zero_kernel!(out, inp, stride::Int, L::Int, total::Int)
+    lin = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if lin <= total
+        idx = ((lin - 1) % stride) + 1
+        t = ((lin - 1) ÷ stride) + 1
+        if t == 1
+            out[lin] = zero(eltype(out))
+        else
+            src_lin = idx + (t - 2) * stride
+            out[lin] = inp[src_lin]
+        end
+    end
+    return nothing
+end
+
+function reverse_cumsum_kernel!(out, inp, stride::Int, L::Int)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx <= stride
+        acc = zero(eltype(out))
+        for t in L:-1:1
+            lin = idx + (t - 1) * stride
+            acc += inp[lin]
+            out[lin] = acc
+        end
+    end
+    return nothing
+end
+
+function reverse_lastdim_cuda(inp::CUDA.CuArray)
+    out = similar(inp)
+    stride = size(inp, 1) * size(inp, 2) * size(inp, 3)
+    L = size(inp, 4)
+    total = length(inp)
+    threads = 256
+    blocks = cld(total, threads)
+    @cuda threads=threads blocks=blocks reverse_lastdim_kernel!(out, inp, stride, L, total)
+    return out
+end
+
+function shift_right_zero_cuda(inp::CUDA.CuArray)
+    out = similar(inp)
+    stride = size(inp, 1) * size(inp, 2) * size(inp, 3)
+    L = size(inp, 4)
+    total = length(inp)
+    threads = 256
+    blocks = cld(total, threads)
+    @cuda threads=threads blocks=blocks shift_right_zero_kernel!(out, inp, stride, L, total)
+    return out
+end
+
+function reverse_cumsum_lastdim_cuda(inp::CUDA.CuArray)
+    out = similar(inp)
+    stride = size(inp, 1) * size(inp, 2) * size(inp, 3)
+    L = size(inp, 4)
+    threads = 256
+    blocks = cld(stride, threads)
+    @cuda threads=threads blocks=blocks reverse_cumsum_kernel!(out, inp, stride, L)
+    return out
+end
+
 """
     parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
 
@@ -270,56 +341,43 @@ function ChainRulesCore.rrule(::typeof(parallel_associative_scan_log), log_a, u)
         ΔS, ΔlogP = Δ
         # Handle cases where one of the gradients is Zero
         if ΔS isa ChainRulesCore.AbstractZero
-            ΔS = zeros(eltype(u), size(u))
+            ΔS = similar(u)
+            fill!(ΔS, zero(eltype(u)))
         end
         if ΔlogP isa ChainRulesCore.AbstractZero
-            ΔlogP = zeros(eltype(log_a), size(log_a))
+            ΔlogP = similar(log_a)
+            fill!(ΔlogP, zero(eltype(log_a)))
         end
         
-        # 1. Gradient w.r.t u (du)
-        # du is computed via reverse scan of ΔS.
-        # Reverse inputs along time dimension (dim 4)
-        ΔS_rev = reverse(ΔS, dims=4)
-        
-        # Prepare multipliers for reverse scan
-        # We need log_a shifted: [0, log_a[L], log_a[L-1], ..., log_a[2]]
-        # which corresponds to multipliers for reverse steps.
-        
-        log_a_rev = reverse(log_a, dims=4)
-        # Create shifted version with 0 padding at start
-        sz = collect(size(log_a))
-        sz[4] = 1
-        pad = zeros(eltype(log_a), Tuple(sz))
-        if CUDA.functional() && log_a isa CUDA.CuArray
-            pad = CUDA.zeros(eltype(log_a), Tuple(sz))
+        L = size(log_a, 4)
+        use_cuda_kernels = CUDA.functional() && log_a isa CUDA.CuArray
+        if use_cuda_kernels
+            ΔS_rev = reverse_lastdim_cuda(ΔS)
+            log_a_rev = reverse_lastdim_cuda(log_a)
+            shifted_log_a_rev = shift_right_zero_cuda(log_a_rev)
+            du_rev, _ = parallel_associative_scan_log(shifted_log_a_rev, ΔS_rev)
+            du = reverse_lastdim_cuda(du_rev)
+            S_prev = shift_right_zero_cuda(S_final)
+            dlog_a = du .* S_prev .* exp.(log_a)
+            dlog_a_from_P = reverse_cumsum_lastdim_cuda(ΔlogP)
+        else
+            ΔS_rev = reverse(ΔS, dims=4)
+            log_a_rev = reverse(log_a, dims=4)
+            shifted_log_a_rev = similar(log_a)
+            @views selectdim(shifted_log_a_rev, 4, 1) .= zero(eltype(log_a))
+            if L > 1
+                @views selectdim(shifted_log_a_rev, 4, 2:L) .= selectdim(log_a_rev, 4, 1:L-1)
+            end
+            du_rev, _ = parallel_associative_scan_log(shifted_log_a_rev, ΔS_rev)
+            du = reverse(du_rev, dims=4)
+            S_prev = similar(S_final)
+            @views selectdim(S_prev, 4, 1) .= zero(eltype(S_final))
+            if L > 1
+                @views selectdim(S_prev, 4, 2:L) .= selectdim(S_final, 4, 1:L-1)
+            end
+            dlog_a = du .* S_prev .* exp.(log_a)
+            dlog_a_from_P = reverse(cumsum(reverse(ΔlogP, dims=4), dims=4), dims=4)
         end
-        
-        # slice 1:L-1
-        slice = selectdim(log_a_rev, 4, 1:size(log_a, 4)-1)
-        shifted_log_a_rev = cat(pad, slice; dims=4)
-        
-        # Run reverse scan
-        # Note: The scan function expects (log_multiplier, value)
-        # We use the same parallel_associative_scan_log
-        du_rev, _ = parallel_associative_scan_log(shifted_log_a_rev, ΔS_rev)
-        
-        # Reverse back to get du
-        du = reverse(du_rev, dims=4)
-        
-        # 2. Gradient w.r.t log_a (dlog_a)
-        # Term 1: from S_final dependence
-        # dlog_a_t += du_t * S_{t-1} * exp(log_a_t)
-        
-        # S_{t-1} (shifted right)
-        slice_S = selectdim(S_final, 4, 1:size(S_final, 4)-1)
-        S_prev = cat(pad, slice_S; dims=4) # Same pad (zeros) works here
-        
-        dlog_a = du .* S_prev .* exp.(log_a)
-        
-        # Term 2: from log_P_final dependence
-        # log_P is cumsum(log_a). Gradient is reverse_cumsum(ΔlogP).
-        # reverse_cumsum(x) = reverse(cumsum(reverse(x)))
-        dlog_a_from_P = reverse(cumsum(reverse(ΔlogP, dims=4), dims=4), dims=4)
         
         dlog_a = dlog_a .+ dlog_a_from_P
         
