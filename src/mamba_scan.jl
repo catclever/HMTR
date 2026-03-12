@@ -119,6 +119,22 @@ function scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride::Int, L::In
     return nothing
 end
 
+function scan_log_doubling_step_kernel!(next_u, next_log, curr_u, curr_log, stride::Int, step::Int, total::Int)
+    lin = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if lin <= total
+        t = ((lin - 1) ÷ stride) + 1
+        if t <= step
+            next_u[lin] = curr_u[lin]
+            next_log[lin] = curr_log[lin]
+        else
+            prev_lin = lin - step * stride
+            next_u[lin] = curr_u[lin] + exp(curr_log[lin]) * curr_u[prev_lin]
+            next_log[lin] = curr_log[lin] + curr_log[prev_lin]
+        end
+    end
+    return nothing
+end
+
 function reverse_lastdim_kernel!(out, inp, stride::Int, L::Int, total::Int)
     lin = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     if lin <= total
@@ -199,22 +215,29 @@ function parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
     L_dim = ndims(u)
     L = size(u, L_dim)
     
-    # Assert dimension 4 matching Mamba's usage
     @assert L_dim == 4 "Expected 4D arrays for log_a and u in GPU dispatch"
+    if L <= 1
+        return copy(u), copy(log_a)
+    end
 
-    stride = size(u, 1) * size(u, 2) * size(u, 3) # Number of independent sequences
-    
-    S_out = similar(u)
-    log_P_out = similar(log_a)
-    
-    # Launch configuration
+    stride = size(u, 1) * size(u, 2) * size(u, 3)
+    total = length(u)
+    curr_u = copy(u)
+    curr_log = copy(log_a)
+    next_u = similar(u)
+    next_log = similar(log_a)
     threads = 256
-    blocks = cld(stride, threads)
-    
-    # Launch Kernel
-    @cuda threads=threads blocks=blocks scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride, L)
-    
-    return S_out, log_P_out
+    blocks = cld(total, threads)
+    num_steps = ceil(Int, log2(L))
+
+    for i in 0:(num_steps - 1)
+        step = 1 << i
+        @cuda threads=threads blocks=blocks scan_log_doubling_step_kernel!(next_u, next_log, curr_u, curr_log, stride, step, total)
+        curr_u, next_u = next_u, curr_u
+        curr_log, next_log = next_log, curr_log
+    end
+
+    return curr_u, curr_log
 end
 
 """
