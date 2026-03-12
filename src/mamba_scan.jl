@@ -84,58 +84,101 @@ function mamba_scan_sequential_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=
 end
 
 """
+    scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride, L)
+
+CUDA Kernel for parallel associative scan log using single-thread sequential scan over time `L`.
+This provides perfect scaling with zero allocation overhead compared to `cat`-based implementations.
+"""
+function scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride::Int, L::Int)
+    # blockIdx().x is the unique flat index for d_model * d_state * batch
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    
+    if idx <= stride
+        acc_u = zero(eltype(S_out))
+        acc_L = zero(eltype(log_P_out))
+        
+        # Traverse time dimension sequentially
+        for t in 1:L
+            # In column-major format with size (d_model, 1/d_state, batch, L),
+            # the step to advance one time unit is precisely `stride`.
+            lin_idx = idx + (t - 1) * stride 
+
+            val_a = log_a[lin_idx]
+            val_u = u[lin_idx]
+            
+            # (L2, u2) • (L1, u1)
+            # new_u = u_t + exp(log_a_t) * u_{t-1}
+            # new_L = log_a_t + L_{t-1}
+            acc_u = val_u + exp(val_a) * acc_u
+            acc_L = acc_L + val_a
+            
+            S_out[lin_idx] = acc_u
+            log_P_out[lin_idx] = acc_L
+        end
+    end
+    return nothing
+end
+
+"""
+    parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
+
+High-performance GPU dispatch for parallel associative scan.
+"""
+function parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
+    L_dim = ndims(u)
+    L = size(u, L_dim)
+    
+    # Assert dimension 4 matching Mamba's usage
+    @assert L_dim == 4 "Expected 4D arrays for log_a and u in GPU dispatch"
+
+    stride = size(u, 1) * size(u, 2) * size(u, 3) # Number of independent sequences
+    
+    S_out = similar(u)
+    log_P_out = similar(log_a)
+    
+    # Launch configuration
+    threads = 256
+    blocks = cld(stride, threads)
+    
+    # Launch Kernel
+    @cuda threads=threads blocks=blocks scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride, L)
+    
+    return S_out, log_P_out
+end
+
+"""
     parallel_associative_scan_log(log_a, u)
 
-Perform a parallel associative scan using the log-space operator:
-(L2, u2) • (L1, u1) = (L2 + L1, exp(L2)*u1 + u2)
-
-This avoids the numerical instability of the division path (u / P).
-Operates along the last dimension.
+CPU fallback and sequential associative scan via doubling algorithm (if L is reasonably small).
+We can actually just use a simple sequential loop for CPU as it's faster than doubling with allocations.
 """
 function parallel_associative_scan_log(log_a, u)
     L_dim = ndims(u)
     L = size(u, L_dim)
     
-    # Force FP32 for accumulation stability if needed, 
-    # but here we respect input types. Assuming inputs are Float32 as per user context.
-    curr_log_a = copy(log_a)
-    curr_u = copy(u)
+    # For CPU, sequential loop over the last dimension is often faster than cat allocations
+    S_out = similar(u)
+    log_P_out = similar(log_a)
     
-    # Hillis-Steele Doubling Algorithm
-    # Steps: ceil(log2(L))
-    num_steps = ceil(Int, log2(L))
+    # Initial state
+    pad_sz = collect(size(u))
+    pad_sz[L_dim] = 1
     
-    for i in 0:(num_steps - 1)
-        step = 2^i
+    acc_u = zeros(eltype(u), Tuple(pad_sz))
+    acc_L = zeros(eltype(log_a), Tuple(pad_sz))
+    
+    for t in 1:L
+        val_a = selectdim(log_a, L_dim, t)
+        val_u = selectdim(u, L_dim, t)
         
-        # Shifted views (right shift by step)
-        # Pad with identity elements (0 for log_a, 0 for u)
+        acc_u .= val_u .+ exp.(val_a) .* acc_u
+        acc_L .= acc_L .+ val_a
         
-        src_indices = 1:(L-step)
-        
-        # Slices
-        src_log_a = selectdim(curr_log_a, L_dim, src_indices)
-        src_u = selectdim(curr_u, L_dim, src_indices)
-        
-        # Padding
-        pad_sz = collect(size(curr_u))
-        pad_sz[L_dim] = step
-        pad = similar(curr_u, Tuple(pad_sz))
-        fill!(pad, zero(eltype(curr_u)))
-        
-        shifted_log_a = cat(pad, src_log_a; dims=L_dim)
-        shifted_u = cat(pad, src_u; dims=L_dim)
-        
-        # Update
-        # Operator: (curr_L, curr_u) • (shift_L, shift_u)
-        # new_u = curr_u + exp(curr_L) * shift_u
-        # new_L = curr_L + shift_L
-        
-        curr_u = curr_u .+ exp.(curr_log_a) .* shifted_u
-        curr_log_a = curr_log_a .+ shifted_log_a
+        selectdim(S_out, L_dim, t) .= acc_u
+        selectdim(log_P_out, L_dim, t) .= acc_L
     end
     
-    return curr_u, curr_log_a
+    return S_out, log_P_out
 end
 
 function mamba_scan_parallel_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=nothing)

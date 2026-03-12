@@ -11,5 +11,5 @@ data/
 *.swo
 .vscode
 .DS_Store
-.agent/
+
 *.tar.gz
