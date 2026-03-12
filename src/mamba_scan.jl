@@ -84,132 +84,101 @@ function mamba_scan_sequential_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev=
 end
 
 """
-    scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride, L)
+    scan_log_single_pass_kernel!(u_out, log_out, log_a, u, stride, L)
 
-CUDA Kernel for parallel associative scan log using single-thread sequential scan over time `L`.
-This provides perfect scaling with zero allocation overhead compared to `cat`-based implementations.
+CUDA Kernel for parallel associative scan log using single-thread sequential scan per sequence.
+Each thread processes one independent sequence along the time dimension `L`.
+This avoids O(log L) kernel launches and O(L log L) global memory traffic,
+providing O(L) complexity and much better performance for large batch/d_model.
 """
-function scan_log_forward_kernel!(S_out, log_P_out, log_a, u, stride::Int, L::Int)
-    # blockIdx().x is the unique flat index for d_model * d_state * batch
+function scan_log_single_pass_kernel!(u_out, log_out, log_a, u, stride::Int, L::Int)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     
     if idx <= stride
-        acc_u = zero(eltype(S_out))
-        acc_L = zero(eltype(log_P_out))
+        # Initial state at t=1
+        curr_u = u[idx]
+        curr_log = log_a[idx]
         
-        # Traverse time dimension sequentially
-        for t in 1:L
-            # In column-major format with size (d_model, 1/d_state, batch, L),
-            # the step to advance one time unit is precisely `stride`.
-            lin_idx = idx + (t - 1) * stride 
-
-            val_a = log_a[lin_idx]
+        u_out[idx] = curr_u
+        log_out[idx] = curr_log
+        
+        for t in 2:L
+            lin_idx = idx + (t - 1) * stride
+            
             val_u = u[lin_idx]
+            val_log = log_a[lin_idx]
             
-            # (L2, u2) • (L1, u1)
-            # new_u = u_t + exp(log_a_t) * u_{t-1}
-            # new_L = log_a_t + L_{t-1}
-            acc_u = val_u + exp(val_a) * acc_u
-            acc_L = acc_L + val_a
+            # (L2, u2) • (L1, u1) = (L2 + L1, exp(L2)u1 + u2)
+            # Accumulate: curr = val • curr
+            curr_u = val_u + exp(val_log) * curr_u
+            curr_log = val_log + curr_log
             
-            S_out[lin_idx] = acc_u
-            log_P_out[lin_idx] = acc_L
+            u_out[lin_idx] = curr_u
+            log_out[lin_idx] = curr_log
         end
     end
     return nothing
 end
 
-function scan_log_doubling_step_kernel!(next_u, next_log, curr_u, curr_log, stride::Int, step::Int, total::Int)
-    lin = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    if lin <= total
-        t = ((lin - 1) ÷ stride) + 1
-        if t <= step
-            next_u[lin] = curr_u[lin]
-            next_log[lin] = curr_log[lin]
-        else
-            prev_lin = lin - step * stride
-            next_u[lin] = curr_u[lin] + exp(curr_log[lin]) * curr_u[prev_lin]
-            next_log[lin] = curr_log[lin] + curr_log[prev_lin]
-        end
-    end
-    return nothing
-end
+"""
+    scan_log_single_pass_backward_kernel!(du_out, dlog_out, dS, dlogP, S_final, log_a, stride, L)
 
-function reverse_lastdim_kernel!(out, inp, stride::Int, L::Int, total::Int)
-    lin = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    if lin <= total
-        idx = ((lin - 1) % stride) + 1
-        t = ((lin - 1) ÷ stride) + 1
-        src_lin = idx + (L - t) * stride
-        out[lin] = inp[src_lin]
-    end
-    return nothing
-end
-
-function shift_right_zero_kernel!(out, inp, stride::Int, L::Int, total::Int)
-    lin = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    if lin <= total
-        idx = ((lin - 1) % stride) + 1
-        t = ((lin - 1) ÷ stride) + 1
-        if t == 1
-            out[lin] = zero(eltype(out))
-        else
-            src_lin = idx + (t - 2) * stride
-            out[lin] = inp[src_lin]
-        end
-    end
-    return nothing
-end
-
-function reverse_cumsum_kernel!(out, inp, stride::Int, L::Int)
+Fused backward kernel for associative scan.
+Computes gradients for `u` and `log_a` in a single reverse pass over time.
+Avoids multiple temporary allocations and kernel launches.
+"""
+function scan_log_single_pass_backward_kernel!(du_out, dlog_out, dS, dlogP, S_final, log_a, stride::Int, L::Int)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    
     if idx <= stride
-        acc = zero(eltype(out))
+        acc_delta = zero(eltype(dS))
+        acc_gamma = zero(eltype(dlogP))
+        
+        # Traverse time backwards from L down to 1
         for t in L:-1:1
-            lin = idx + (t - 1) * stride
-            acc += inp[lin]
-            out[lin] = acc
+            lin_idx = idx + (t - 1) * stride
+            
+            # Load gradients
+            val_dS = dS[lin_idx]
+            val_dlogP = dlogP[lin_idx]
+            
+            # Update gamma (reverse suffix sum of dlogP)
+            acc_gamma += val_dlogP
+            
+            # Update delta
+            # delta_t = dS_t + exp(log_a_{t+1}) * delta_{t+1}
+            if t < L
+                next_lin_idx = lin_idx + stride
+                log_a_next = log_a[next_lin_idx]
+                acc_delta = val_dS + exp(log_a_next) * acc_delta
+            else
+                acc_delta = val_dS
+            end
+            
+            # Compute du_t = delta_t
+            du_out[lin_idx] = acc_delta
+            
+            # Compute dlog_a_t
+            # dlog_a_t = delta_t * exp(log_a_t) * S_{t-1} + acc_gamma
+            term1 = zero(eltype(dS))
+            if t > 1
+                prev_lin_idx = lin_idx - stride
+                S_prev = S_final[prev_lin_idx]
+                log_a_curr = log_a[lin_idx]
+                term1 = acc_delta * exp(log_a_curr) * S_prev
+            end
+            
+            dlog_out[lin_idx] = term1 + acc_gamma
         end
     end
     return nothing
-end
-
-function reverse_lastdim_cuda(inp::CUDA.CuArray)
-    out = similar(inp)
-    stride = size(inp, 1) * size(inp, 2) * size(inp, 3)
-    L = size(inp, 4)
-    total = length(inp)
-    threads = 256
-    blocks = cld(total, threads)
-    @cuda threads=threads blocks=blocks reverse_lastdim_kernel!(out, inp, stride, L, total)
-    return out
-end
-
-function shift_right_zero_cuda(inp::CUDA.CuArray)
-    out = similar(inp)
-    stride = size(inp, 1) * size(inp, 2) * size(inp, 3)
-    L = size(inp, 4)
-    total = length(inp)
-    threads = 256
-    blocks = cld(total, threads)
-    @cuda threads=threads blocks=blocks shift_right_zero_kernel!(out, inp, stride, L, total)
-    return out
-end
-
-function reverse_cumsum_lastdim_cuda(inp::CUDA.CuArray)
-    out = similar(inp)
-    stride = size(inp, 1) * size(inp, 2) * size(inp, 3)
-    L = size(inp, 4)
-    threads = 256
-    blocks = cld(stride, threads)
-    @cuda threads=threads blocks=blocks reverse_cumsum_kernel!(out, inp, stride, L)
-    return out
 end
 
 """
     parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
 
-High-performance GPU dispatch for parallel associative scan.
+High-performance GPU dispatch for parallel associative scan using "One Thread Per Sequence" strategy.
+This is significantly faster than Hillis-Steele for large batch sizes.
 """
 function parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
     L_dim = ndims(u)
@@ -221,23 +190,16 @@ function parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
     end
 
     stride = size(u, 1) * size(u, 2) * size(u, 3)
-    total = length(u)
-    curr_u = copy(u)
-    curr_log = copy(log_a)
-    next_u = similar(u)
-    next_log = similar(log_a)
+    
+    u_out = similar(u)
+    log_out = similar(log_a)
+    
     threads = 256
-    blocks = cld(total, threads)
-    num_steps = ceil(Int, log2(L))
-
-    for i in 0:(num_steps - 1)
-        step = 1 << i
-        @cuda threads=threads blocks=blocks scan_log_doubling_step_kernel!(next_u, next_log, curr_u, curr_log, stride, step, total)
-        curr_u, next_u = next_u, curr_u
-        curr_log, next_log = next_log, curr_log
-    end
-
-    return curr_u, curr_log
+    blocks = cld(stride, threads)
+    
+    @cuda threads=threads blocks=blocks scan_log_single_pass_kernel!(u_out, log_out, log_a, u, stride, L)
+    
+    return u_out, log_out
 end
 
 """
@@ -375,14 +337,15 @@ function ChainRulesCore.rrule(::typeof(parallel_associative_scan_log), log_a, u)
         L = size(log_a, 4)
         use_cuda_kernels = CUDA.functional() && log_a isa CUDA.CuArray
         if use_cuda_kernels
-            ΔS_rev = reverse_lastdim_cuda(ΔS)
-            log_a_rev = reverse_lastdim_cuda(log_a)
-            shifted_log_a_rev = shift_right_zero_cuda(log_a_rev)
-            du_rev, _ = parallel_associative_scan_log(shifted_log_a_rev, ΔS_rev)
-            du = reverse_lastdim_cuda(du_rev)
-            S_prev = shift_right_zero_cuda(S_final)
-            dlog_a = du .* S_prev .* exp.(log_a)
-            dlog_a_from_P = reverse_cumsum_lastdim_cuda(ΔlogP)
+            du = similar(u)
+            dlog_a = similar(log_a)
+            stride = size(u, 1) * size(u, 2) * size(u, 3)
+            threads = 256
+            blocks = cld(stride, threads)
+            
+            @cuda threads=threads blocks=blocks scan_log_single_pass_backward_kernel!(
+                du, dlog_a, ΔS, ΔlogP, S_final, log_a, stride, L
+            )
         else
             ΔS_rev = reverse(ΔS, dims=4)
             log_a_rev = reverse(log_a, dims=4)
@@ -400,9 +363,8 @@ function ChainRulesCore.rrule(::typeof(parallel_associative_scan_log), log_a, u)
             end
             dlog_a = du .* S_prev .* exp.(log_a)
             dlog_a_from_P = reverse(cumsum(reverse(ΔlogP, dims=4), dims=4), dims=4)
+            dlog_a = dlog_a .+ dlog_a_from_P
         end
-        
-        dlog_a = dlog_a .+ dlog_a_from_P
         
         return (ChainRulesCore.NoTangent(), dlog_a, du)
     end
