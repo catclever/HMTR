@@ -120,6 +120,28 @@ function scan_log_single_pass_kernel!(u_out, log_out, log_a, u, stride::Int, L::
     return nothing
 end
 
+function scan_log_hillis_steele_step_kernel!(u_next, log_next, u_prev, log_prev, stride::Int, L::Int, offset::Int, total::Int)
+    tid = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if tid <= total
+        t = ((tid - 1) ÷ stride) + 1
+        if t > offset
+            seq_idx = ((tid - 1) % stride) + 1
+            prev_t = t - offset
+            prev_lin = seq_idx + (prev_t - 1) * stride
+            curr_u = u_prev[tid]
+            curr_log = log_prev[tid]
+            prev_u = u_prev[prev_lin]
+            prev_log = log_prev[prev_lin]
+            u_next[tid] = curr_u + exp(curr_log) * prev_u
+            log_next[tid] = curr_log + prev_log
+        else
+            u_next[tid] = u_prev[tid]
+            log_next[tid] = log_prev[tid]
+        end
+    end
+    return nothing
+end
+
 """
     scan_log_single_pass_backward_kernel!(du_out, dlog_out, dS, dlogP, S_final, log_a, stride, L)
 
@@ -190,16 +212,34 @@ function parallel_associative_scan_log(log_a::CUDA.CuArray, u::CUDA.CuArray)
     end
 
     stride = size(u, 1) * size(u, 2) * size(u, 3)
-    
-    u_out = similar(u)
-    log_out = similar(log_a)
-    
-    threads = 256
-    blocks = cld(stride, threads)
-    
-    @cuda threads=threads blocks=blocks scan_log_single_pass_kernel!(u_out, log_out, log_a, u, stride, L)
-    
-    return u_out, log_out
+    impl = lowercase(get(ENV, "MAMBA_SCAN_IMPL", "single_pass"))
+
+    if impl == "time_parallel" || impl == "hillis_steele"
+        total = stride * L
+        threads = 256
+        blocks = cld(total, threads)
+        u_prev = copy(u)
+        log_prev = copy(log_a)
+        u_next = similar(u)
+        log_next = similar(log_a)
+        offset = 1
+        while offset < L
+            @cuda threads=threads blocks=blocks scan_log_hillis_steele_step_kernel!(
+                u_next, log_next, u_prev, log_prev, stride, L, offset, total
+            )
+            u_prev, u_next = u_next, u_prev
+            log_prev, log_next = log_next, log_prev
+            offset <<= 1
+        end
+        return u_prev, log_prev
+    else
+        u_out = similar(u)
+        log_out = similar(log_a)
+        threads = 256
+        blocks = cld(stride, threads)
+        @cuda threads=threads blocks=blocks scan_log_single_pass_kernel!(u_out, log_out, log_a, u, stride, L)
+        return u_out, log_out
+    end
 end
 
 """

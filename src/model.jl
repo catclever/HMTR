@@ -127,7 +127,6 @@ Lux.initialstates(rng::AbstractRNG, l::SimplifiedMambaBlock) = (
     h=nothing
 )
 
-
 function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, D, h_prev)
     y, h_last, hs = mamba_scan_with_state(x, dt_raw, B_raw, C_raw, A, D, h_prev, false)
 
@@ -182,8 +181,6 @@ function ChainRulesCore.rrule(::typeof(mamba_scan), x, dt_raw, B_raw, C_raw, A, 
             Ct = C_raw[:, t, :]
             dt_val = NNlib.softplus.(dt_raw_t) .* dt_scale .+ dt_min
             dt = clamp.(dt_val, dt_min, 5f0)
-            
-            # Mask for dt gradient: 1 if not clamped, 0 if clamped
             dt_mask = (dt_val .>= dt_min) .& (dt_val .<= 5f0)
 
             dt3 = reshape(dt, d_model, 1, batch)

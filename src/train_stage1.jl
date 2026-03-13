@@ -67,6 +67,7 @@ const DTYPE = get(ENV, "DTYPE", "fp32")
 const ENCODER_DTYPE = get(ENV, "ENCODER_DTYPE", "")
 const NORM_DTYPE = get(ENV, "NORM_DTYPE", "")
 const DECODER_DTYPE = get(ENV, "DECODER_DTYPE", "")
+const CE_CHUNK_TOKENS = parse(Int, get(ENV, "CE_CHUNK_TOKENS", "0"))
 const RESUME_CKPT = get(ENV, "RESUME_CKPT", "")
 const RESUME_META_FILE = get(ENV, "RESUME_META_FILE", "")
 const SEQ_LEN = parse(Int, get(ENV, "SEQ_LEN", "1024"))
@@ -213,6 +214,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     norm_dtype = string(get(cli, :norm_dtype, NORM_DTYPE))
     decoder_dtype = string(get(cli, :decoder_dtype, DECODER_DTYPE))
     seq_len = parse(Int, string(get(cli, :seq_len, SEQ_LEN)))
+    ce_chunk_tokens = parse(Int, string(get(cli, :ce_chunk_tokens, CE_CHUNK_TOKENS)))
 
     resume_meta_file = string(get(cli, :resume_meta_file, get(cli, :resume_meta, RESUME_META_FILE)))
 
@@ -279,6 +281,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         encoder_dtype,
         norm_dtype,
         decoder_dtype,
+        ce_chunk_tokens,
         warmup_steps,
         kl_weight,
         pred_weight,
@@ -640,7 +643,7 @@ function update_loss_ema(ema, internals; alpha::Float32=0.05f0)
     )
 end
 
-function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0, var_dir_weight::Float32=0f0, var_mag_weight::Float32=0f0, var_mag_low::Float32=0.2f0, var_mag_high::Float32=3.5f0, teacher_forcing::Bool=false)
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0, var_dir_weight::Float32=0f0, var_mag_weight::Float32=0f0, var_mag_low::Float32=0.2f0, var_mag_high::Float32=3.5f0, teacher_forcing::Bool=false, ce_chunk_tokens::Int=0)
     out, st_new = model(x_batch, ps, st; teacher_forcing=teacher_forcing)
     y_pred, mu, logvar, z, z_pred = out.logits, out.mu, out.logvar, out.z, out.z_pred
     
@@ -671,17 +674,22 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int,
     y_pred_flat = reshape(y_pred_pad, vocab_size, :)
     y_batch_flat = reshape(y_batch_pad, :)
 
-    logits = eltype(y_pred_flat) <: Union{Float16,Core.BFloat16} ? Float32.(y_pred_flat) : y_pred_flat
-    log_probs = logsoftmax_stable(logits; dims=1)
-
-    mask = y_batch_flat .!= pad_id
-    weights = Float32.(mask)
-
-    picked = gather2d(log_probs, y_batch_flat)
-    
-    # Simple mean loss over valid tokens
-    num = sum((-picked) .* weights)
-    den = sum(weights)
+    n_tokens = size(y_pred_flat, 2)
+    chunk = ce_chunk_tokens > 0 ? min(ce_chunk_tokens, n_tokens) : n_tokens
+    num = zero(Float32)
+    den = zero(Float32)
+    for s in 1:chunk:n_tokens
+        e = min(s + chunk - 1, n_tokens)
+        y_pred_chunk = y_pred_flat[:, s:e]
+        y_batch_chunk = y_batch_flat[s:e]
+        logits = eltype(y_pred_chunk) <: Union{Float16,Core.BFloat16} ? Float32.(y_pred_chunk) : y_pred_chunk
+        log_probs = logsoftmax_stable(logits; dims=1)
+        mask = y_batch_chunk .!= pad_id
+        weights = Float32.(mask)
+        picked = gather2d(log_probs, y_batch_chunk)
+        num += sum((-picked) .* weights)
+        den += sum(weights)
+    end
     recon_loss = num / max(den, 1f0)
 
     kl_loss = zero(recon_loss)
@@ -1241,6 +1249,7 @@ function train(cfg)
                     var_mag_low=Float32(cfg.var_mag_low),
                     var_mag_high=Float32(cfg.var_mag_high),
                     teacher_forcing=cfg.teacher_forcing,
+                    ce_chunk_tokens=cfg.ce_chunk_tokens,
                 )
                 st_holder[] = st_tmp
                 internals_holder[] = internals_tmp
@@ -1382,6 +1391,7 @@ function train_stage1(args::Vector{String})
         println("  --var-mag-weight <float>  Base variance magnitude loss weight")
         println("  --auto-loss-balance <0|1> Enable adaptive loss balancing")
         println("  --seq-len <int>           Stream chunk length (default: $SEQ_LEN)")
+        println("  --ce-chunk-tokens <int>   CE分块token数，0表示关闭分块 (default: $CE_CHUNK_TOKENS)")
         println("  --teacher-forcing         Enable teacher forcing")
         println("  --inspect-data            Inspect data instead of training")
         return

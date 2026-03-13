@@ -76,11 +76,12 @@ function typecheck_entry(args::Vector{String})
     println("Typecheck skipped due to JET precompilation issues.")
 end
 
-function main(args::Vector{String})
+function main(args::AbstractVector{<:AbstractString})
+    args_str = String.(args)
     # Load .env at startup
     Utils.load_dotenv()
 
-    if isempty(args)
+    if isempty(args_str)
         println("Usage: julia hmtr.jl [command] [options...]")
         println("\nCommands:")
         println("  train_stage1 (alias: train) - Train the Stage 1 AutoEncoder")
@@ -95,8 +96,8 @@ function main(args::Vector{String})
         return
     end
 
-    command = args[1]
-    sub_args = args[2:end]
+    command = args_str[1]
+    sub_args = args_str[2:end]
 
     if command == "train" || command == "train_stage1"
         if "--help" in sub_args || "-h" in sub_args
@@ -133,6 +134,10 @@ function main(args::Vector{String})
         println("Available: train_stage1, train_stage2, infer_stage1, infer_stage2, train_stage1_ve, infer_stage1_ve, data, lint, typecheck")
         exit(1)
     end
+end
+
+function main(args::AbstractVector)
+    return main(string.(args))
 end
 
 end # module
