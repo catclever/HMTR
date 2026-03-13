@@ -9,7 +9,7 @@ data/
 *.log
 *.swp
 *.swo
-.vscode
+.vscode/
 .DS_Store
 
 *.tar.gz
