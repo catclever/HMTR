@@ -962,7 +962,7 @@ Lux.initialstates(rng::AbstractRNG, m::HMTR_Stage1_AutoEncoder) = (
     decoder=Lux.initialstates(rng, m.decoder)
 )
 
-function (m::HMTR_Stage1_AutoEncoder)(x, ps, st; teacher_forcing::Bool=false)
+function (m::HMTR_Stage1_AutoEncoder)(x, ps, st; teacher_forcing::Bool=false, compute_predictor::Bool=true)
     # x: [L, B] (Indices)
     L, B = size(x)
 
@@ -984,7 +984,11 @@ function (m::HMTR_Stage1_AutoEncoder)(x, ps, st; teacher_forcing::Bool=false)
     # Note: predicting z_{t+1} from z_t. 
     # Current call returns z_pred corresponding to input z.
     # In loss function we will align z_pred[t] with z[t+1].
-    z_pred, st_pred = m.predictor(capsules_norm, ps.predictor, st.predictor)
+    z_pred = nothing
+    st_pred = st.predictor
+    if compute_predictor
+        z_pred, st_pred = m.predictor(capsules_norm, ps.predictor, st.predictor)
+    end
     
     # 4. Decode -> Text
     # Decoder reconstructs text from the *normalized* capsules

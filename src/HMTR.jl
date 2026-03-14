@@ -22,6 +22,8 @@ include("train_stage1.jl")
 @reexport using .TrainStage1
 include("train_stage2.jl")
 @reexport using .TrainStage2
+include("train_stage_joint.jl")
+@reexport using .TrainStageJoint
 include("infer_stage1.jl")
 @reexport using .InferStage1
 
@@ -86,6 +88,7 @@ function main(args::AbstractVector{<:AbstractString})
         println("\nCommands:")
         println("  train_stage1 (alias: train) - Train the Stage 1 AutoEncoder")
         println("  train_stage2               - Train the Stage 2 Reasoner")
+        println("  train_stage_joint (alias: train_joint) - Train unified Stage1+Stage2 objective")
         println("  infer_stage1 (alias: infer) - Run inference/sampling with Stage 1 model")
         println("  infer_stage2               - Run inference with Stage 2 model")
         println("  train_stage1_ve (alias: train_ve) - Train the Stage 1 VE AutoEncoder")
@@ -115,6 +118,12 @@ function main(args::AbstractVector{<:AbstractString})
             return
         end
         TrainStage2.train_stage2(sub_args)
+    elseif command == "train_joint" || command == "train_stage_joint"
+        if "--help" in sub_args || "-h" in sub_args
+            TrainStageJoint.train_stage_joint(sub_args)
+            return
+        end
+        TrainStageJoint.train_stage_joint(sub_args)
     elseif command == "train_ve" || command == "train_stage1_ve"
         if "--help" in sub_args || "-h" in sub_args
             VETrainStage1.train_stage1(sub_args)
@@ -131,7 +140,7 @@ function main(args::AbstractVector{<:AbstractString})
         typecheck_entry(sub_args)
     else
         println("Unknown command: $command")
-        println("Available: train_stage1, train_stage2, infer_stage1, infer_stage2, train_stage1_ve, infer_stage1_ve, data, lint, typecheck")
+        println("Available: train_stage1, train_stage2, train_stage_joint, infer_stage1, infer_stage2, train_stage1_ve, infer_stage1_ve, data, lint, typecheck")
         exit(1)
     end
 end

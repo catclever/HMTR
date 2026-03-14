@@ -56,6 +56,7 @@ const VAR_DIR_FULL_FRAC = parse(Float64, get(ENV, "VAR_DIR_FULL_FRAC", "0.40"))
 const PRED_DECAY_START_FRAC = parse(Float64, get(ENV, "PRED_DECAY_START_FRAC", "0.75"))
 const PRED_DECAY_END_SCALE = parse(Float64, get(ENV, "PRED_DECAY_END_SCALE", "0.60"))
 const TEACHER_FORCING = parse(Int, get(ENV, "TEACHER_FORCING", "0"))
+const ENABLE_PRED_TASK = parse(Int, get(ENV, "ENABLE_PRED_TASK", "1"))
 
 const PRETRAIN_EMB_FILE = get(ENV, "PRETRAIN_EMB_FILE", "")
 const INSPECT_DATA = parse(Int, get(ENV, "INSPECT_DATA", "0"))
@@ -207,6 +208,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     var_mag_low = max(var_mag_low, 0.0)
     var_mag_high = max(var_mag_high, var_mag_low + 1e-6)
     teacher_forcing = parse_bool(:teacher_forcing, TEACHER_FORCING)
+    enable_pred_task = parse_bool(:enable_pred_task, ENABLE_PRED_TASK) && !(string(get(cli, :disable_pred_task, "false")) == "true")
     use_parallel = parse_bool(:use_parallel, 0)
     inspect_seed = parse(Int, string(get(cli, :inspect_seed, INSPECT_SEED)))
     dtype = string(get(cli, :dtype, DTYPE))
@@ -298,6 +300,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         pred_decay_start_frac,
         pred_decay_end_scale,
         teacher_forcing,
+        enable_pred_task,
         use_parallel,
         seq_len,
         meta_data = ckpt_meta_data,
@@ -608,7 +611,7 @@ function compute_adaptive_loss_weights(cfg, train_step::Int, total_steps::Int, e
     pred_decay = _phase_decay(progress, Float32(cfg.pred_decay_start_frac), Float32(cfg.pred_decay_end_scale))
     var_dir_phase = _phase_ramp(progress, Float32(cfg.var_dir_start_frac), Float32(cfg.var_dir_full_frac))
 
-    pred_weight = Float32(cfg.pred_weight) * pred_phase * pred_decay
+    pred_weight = cfg.enable_pred_task ? (Float32(cfg.pred_weight) * pred_phase * pred_decay) : 0f0
     var_dir_weight = Float32(cfg.var_dir_weight) * var_dir_phase
     var_mag_weight = Float32(cfg.var_mag_weight)
 
@@ -643,9 +646,10 @@ function update_loss_ema(ema, internals; alpha::Float32=0.05f0)
     )
 end
 
-function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0, var_dir_weight::Float32=0f0, var_mag_weight::Float32=0f0, var_mag_low::Float32=0.2f0, var_mag_high::Float32=3.5f0, teacher_forcing::Bool=false, ce_chunk_tokens::Int=0)
-    out, st_new = model(x_batch, ps, st; teacher_forcing=teacher_forcing)
-    y_pred, mu, logvar, z, z_pred = out.logits, out.mu, out.logvar, out.z, out.z_pred
+function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int, kl_weight::Float32=0f0, pred_weight::Float32=0f0, var_dir_weight::Float32=0f0, var_mag_weight::Float32=0f0, var_mag_low::Float32=0.2f0, var_mag_high::Float32=3.5f0, teacher_forcing::Bool=false, ce_chunk_tokens::Int=0, enable_pred_task::Bool=true)
+    out, st_new = model(x_batch, ps, st; teacher_forcing=teacher_forcing, compute_predictor=enable_pred_task)
+    y_pred, mu, logvar, z = out.logits, out.mu, out.logvar, out.z
+    z_pred = out.z_pred
     
     L, B = size(x_batch)
 
@@ -705,7 +709,7 @@ function compute_loss(model, ps, st, x_batch, y_batch; pad_id::Int, eos_id::Int,
     mean_var = mean(var)
     
     kl_dim_vector = mean(-0.5f0 .* (1f0 .+ logvar_clamped .- abs2.(mu) .- var); dims=(2,3)) 
-    if Lcap > 1
+    if enable_pred_task && pred_weight > 0f0 && Lcap > 1 && !(z_pred isa Nothing)
         z_target = Zygote.dropgrad(z[:, 2:end, :])
         z_p = z_pred[:, 1:end-1, :]
         
@@ -1250,6 +1254,7 @@ function train(cfg)
                     var_mag_high=Float32(cfg.var_mag_high),
                     teacher_forcing=cfg.teacher_forcing,
                     ce_chunk_tokens=cfg.ce_chunk_tokens,
+                    enable_pred_task=cfg.enable_pred_task,
                 )
                 st_holder[] = st_tmp
                 internals_holder[] = internals_tmp
@@ -1387,6 +1392,8 @@ function train_stage1(args::Vector{String})
         println("  --mamba-d-state <int>     Mamba d_state (default: $MAMBA_D_STATE)")
         println("  --warmup-steps <int>      Warmup steps (default: $WARMUP_STEPS)")
         println("  --pred-weight <float>     Base prediction loss weight")
+        println("  --enable-pred-task <0|1> Enable predictor forward/loss computation (default: $ENABLE_PRED_TASK)")
+        println("  --disable-pred-task       Disable predictor forward/loss computation completely")
         println("  --var-dir-weight <float>  Base variance direction loss weight")
         println("  --var-mag-weight <float>  Base variance magnitude loss weight")
         println("  --auto-loss-balance <0|1> Enable adaptive loss balancing")
