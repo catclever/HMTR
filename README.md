@@ -42,6 +42,7 @@ Available parameters when running `hmtr.jl train_stage_joint`.
 | `--force-cpu` | Bool | false | 强制使用 CPU。<br>Force CPU usage. |
 | `--add-timestamp` | Bool | true | 文件名添加时间戳。<br>Add timestamp to filenames. |
 | `--use-parallel` | Bool | true | 是否启用并行计算优化。<br>Enable parallel computation optimization. |
+| `--dtype` | String | "fp32" | 参数与状态精度（`fp32`/`fp16`/`bf16`）。显存紧张时建议优先尝试 `bf16`。<br>Parameter/state precision (`fp32`/`fp16`/`bf16`). Under memory pressure, try `bf16` first. |
 
 ### 模型架构参数 / Model Architecture Params
 

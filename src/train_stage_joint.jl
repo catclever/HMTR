@@ -11,6 +11,7 @@ using CUDA
 using LuxCUDA
 using Dates
 using Statistics
+using LinearAlgebra
 using ..Utils
 using ..Model
 import ..TrainStage1
@@ -65,6 +66,7 @@ const VAR_DIR_START_FRAC = parse(Float64, get(ENV, "VAR_DIR_START_FRAC", "0.6"))
 const VAR_DIR_FULL_FRAC = parse(Float64, get(ENV, "VAR_DIR_FULL_FRAC", "0.85"))
 const PRED_SELECT_MODE = get(ENV, "PRED_SELECT_MODE", "best")
 const USE_PARALLEL = parse(Int, get(ENV, "USE_PARALLEL", "1"))
+const DTYPE = get(ENV, "DTYPE", "fp32")
 const VAR_LR_BASE_SCALE = parse(Float64, get(ENV, "VAR_LR_BASE_SCALE", "1.0"))
 const VAR_LR_START_FRAC = parse(Float64, get(ENV, "VAR_LR_START_FRAC", "0.0"))
 const VAR_LR_FULL_FRAC = parse(Float64, get(ENV, "VAR_LR_FULL_FRAC", "0.0"))
@@ -107,6 +109,7 @@ function resolve_config(cli::Dict{Symbol,Any})
     force_cpu = parse_bool(get(cli, :force_cpu, FORCE_CPU))
     add_timestamp = parse_bool(get(cli, :add_timestamp, ADD_TIMESTAMP))
     use_parallel = parse_bool(get(cli, :use_parallel, USE_PARALLEL))
+    dtype = string(get(cli, :dtype, DTYPE))
 
     k_streams = parse(Int, string(get(cli, :k_streams, K_STREAMS)))
     heads = parse(Int, string(get(cli, :heads, HEADS)))
@@ -145,7 +148,7 @@ function resolve_config(cli::Dict{Symbol,Any})
         checkpoint_prefix = "$(checkpoint_prefix)_$(ts)"
     end
 
-    return (; data_file, meta_file, checkpoint_dir, checkpoint_prefix, epochs, batch_size, lr, max_batches, save_every, grad_clip_norm, loss_spike_threshold, skip_on_spike, warmup_steps, dim, mamba_d_state, block_size, seq_len, force_cpu, use_parallel, k_streams, heads, num_layers, k_drop_threshold, k_drop_min, recon_weight, kl_weight, pred_weight, var_dir_weight, var_mag_weight, var_mag_low, var_mag_high, enable_recon_task, enable_kl_loss, enable_pred_task, enable_var_dir_loss, enable_var_mag_loss, teacher_forcing, pred_warmup_frac, pred_start_frac, pred_full_frac, var_dir_start_frac, var_dir_full_frac, pred_select_mode, var_lr_base_scale, var_lr_start_frac, var_lr_full_frac, var_lr_decay_start_frac, var_lr_end_scale)
+    return (; data_file, meta_file, checkpoint_dir, checkpoint_prefix, epochs, batch_size, lr, max_batches, save_every, grad_clip_norm, loss_spike_threshold, skip_on_spike, warmup_steps, dim, mamba_d_state, block_size, seq_len, force_cpu, use_parallel, dtype, k_streams, heads, num_layers, k_drop_threshold, k_drop_min, recon_weight, kl_weight, pred_weight, var_dir_weight, var_mag_weight, var_mag_low, var_mag_high, enable_recon_task, enable_kl_loss, enable_pred_task, enable_var_dir_loss, enable_var_mag_loss, teacher_forcing, pred_warmup_frac, pred_start_frac, pred_full_frac, var_dir_start_frac, var_dir_full_frac, pred_select_mode, var_lr_base_scale, var_lr_start_frac, var_lr_full_frac, var_lr_decay_start_frac, var_lr_end_scale)
 end
 
 function _phase_ramp(progress::Float32, start_frac::Float32, full_frac::Float32)
@@ -186,6 +189,78 @@ function apply_var_grad_scale(grads, scale::Float32)
     encoder_scaled = merge(grads.model.encoder, (var_head=var_head_scaled,))
     model_scaled = merge(grads.model, (encoder=encoder_scaled,))
     return merge(grads, (model=model_scaled,))
+end
+
+const _BF16_GPU_FALLBACK_INSTALLED = Ref(false)
+
+function Lux.LuxLib.Impl.matmuladd!(
+    C::AbstractMatrix{Core.BFloat16},
+    ::Lux.LuxLib.GPUBroadcastOp{Lux.MLDataDevices.CUDADevice},
+    A::AbstractMatrix{Core.BFloat16},
+    B::AbstractMatrix{Core.BFloat16},
+    bias::AbstractVector{Core.BFloat16},
+)
+    C .= bias
+    LinearAlgebra.mul!(C, A, B, true, true)
+    return nothing
+end
+
+function Lux.LuxLib.Impl.fused_dense!(
+    y::AbstractMatrix{Core.BFloat16},
+    opmode::Lux.LuxLib.GPUBroadcastOp{Lux.MLDataDevices.CUDADevice},
+    act::F,
+    weight::AbstractMatrix{Core.BFloat16},
+    x::AbstractMatrix{Core.BFloat16},
+    b::Union{Nothing,AbstractVector{Core.BFloat16}},
+) where {F}
+    Lux.LuxLib.Impl.matmul!(y, opmode, weight, x)
+    Lux.LuxLib.Impl.bias_activation!(y, opmode, act, y, b)
+    return nothing
+end
+
+function Lux.LuxLib.Impl.cublasLt_fused_dense!(
+    z::AbstractMatrix{Core.BFloat16},
+    act::F,
+    weight::AbstractMatrix{Core.BFloat16},
+    x::AbstractMatrix{Core.BFloat16},
+    b::Union{Nothing,AbstractVector{Core.BFloat16}},
+) where {F}
+    LinearAlgebra.mul!(z, weight, x)
+    if b === nothing
+        broadcast!(act, z, z)
+    else
+        broadcast!(act ∘ +, z, z, reshape(b, :, 1))
+    end
+    return nothing
+end
+
+function Lux.LuxLib.Impl.cublasLt_fused_dense!(
+    z::AbstractMatrix{Core.BFloat16},
+    act::F,
+    weight::AbstractMatrix{Core.BFloat16},
+    x::AbstractMatrix{Core.BFloat16},
+    b::Union{Nothing,AbstractVector{Core.BFloat16}},
+    y::AbstractMatrix{Core.BFloat16},
+) where {F}
+    LinearAlgebra.mul!(y, weight, x)
+    if b === nothing
+        broadcast!(act, y, y)
+    else
+        broadcast!(act ∘ +, y, y, reshape(b, :, 1))
+    end
+    broadcast!(act, z, y)
+    return nothing
+end
+
+function install_bf16_gpu_fallback!()
+    _BF16_GPU_FALLBACK_INSTALLED[] && return nothing
+    _BF16_GPU_FALLBACK_INSTALLED[] = true
+    return nothing
+end
+
+function apply_precision(ps, st, cfg)
+    T = something(TrainStage1.parse_dtype(cfg.dtype), Float32)
+    return TrainStage1.cast_floats(ps, T), TrainStage1.cast_floats(st, T), T
 end
 
 function select_device(force_cpu::Bool)
@@ -299,6 +374,7 @@ function train(cfg)
     dev = select_device(cfg.force_cpu)
     cpu = cpu_device()
     println("Using device: $dev")
+    enable_bf16_gpu_fallback = CUDA.functional() && !cfg.force_cpu && lowercase(cfg.dtype) in ("bf16", "bfloat16")
     data_content, reset_flags, vocab_size, is_stream, is_bucketed, pad_id, eos_id, _mask_id, _vocab, meta_data = TrainStage1.load_data(cfg.data_file, cfg.meta_file)
     N_total = is_stream ? length(data_content) : (is_bucketed ? sum(size(v, 2) for (_, v) in data_content) : size(data_content, 2))
     println("Loaded data. Total: $N_total, Vocab: $vocab_size")
@@ -312,8 +388,14 @@ function train(cfg)
     ps_model, st_model = Lux.setup(rng, model)
     ps_mix, st_mix = Lux.setup(rng, mixer)
     ps_reas, st_reas = Lux.setup(rng, reasoner)
-    ps = (model=ps_model, mixer=ps_mix, reasoner=ps_reas) |> dev
-    st = (model=st_model, mixer=st_mix, reasoner=st_reas) |> dev
+    ps, st, dtype_used = apply_precision((model=ps_model, mixer=ps_mix, reasoner=ps_reas), (model=st_model, mixer=st_mix, reasoner=st_reas), cfg)
+    println("Precision | dtype=$(dtype_used)")
+    ps = ps |> dev
+    st = st |> dev
+    if enable_bf16_gpu_fallback
+        install_bf16_gpu_fallback!()
+        println("Precision Runtime | BF16 GPU dense fallback enabled")
+    end
 
     opt = Optimisers.Adam(cfg.lr)
     opt_state = Optimisers.setup(opt, ps)
@@ -346,6 +428,7 @@ function train(cfg)
             local x_cpu_raw, reset_mask
             if is_stream
                 x_cpu_raw, reset_mask = batch_data
+                x_cpu_raw = Matrix{Int}(x_cpu_raw)
             else
                 b_key, b_ids = batch_data
                 tokens_cpu = is_bucketed ? data_content[b_key][:, b_ids] : data_content[:, b_ids]
@@ -455,6 +538,7 @@ function train_stage_joint(args::Vector{String})
         println("  --var-lr-decay-start-frac <0-1> Start fraction for var LR decay")
         println("  --var-lr-end-scale <float> End LR multiplier for var_head gradients")
         println("  --teacher-forcing <0|1>    Use teacher forcing for reconstruction")
+        println("  --dtype <fp32|fp16|bf16>   Precision for model parameters/states")
         println("  --use-parallel <0|1>       Enable parallel scan")
         println("  --force-cpu <0|1>          Force CPU training")
         return
