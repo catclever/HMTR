@@ -18,6 +18,7 @@ include("model.jl")
 
 include("data.jl")
 @reexport using .Data
+include("precision_runtime.jl")
 include("train_stage1.jl")
 @reexport using .TrainStage1
 include("train_stage2.jl")
