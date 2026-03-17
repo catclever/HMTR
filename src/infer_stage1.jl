@@ -12,7 +12,7 @@ using ..Utils
 using ..Model
 using ..Data
 
-export infer_stage1, infer_stage2
+export infer_stage1, infer_stage2, infer_joint
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 const DATA_DIR = get(ENV, "DATA_DIR", joinpath(PROJECT_ROOT, "data"))
@@ -22,6 +22,7 @@ const CHECKPOINT_DIR = get(ENV, "CHECKPOINT_DIR", joinpath(PROJECT_ROOT, "checkp
 const CHECKPOINT_FILE = get(ENV, "CHECKPOINT_FILE", "")
 const STAGE1_CKPT = get(ENV, "STAGE1_CKPT", "")
 const TEXT = get(ENV, "TEXT", "")
+const TEXT_FILE = get(ENV, "TEXT_FILE", "")
 const SHOW_IDS = parse(Int, get(ENV, "SHOW_IDS", "0"))
 const FORCE_CPU = parse(Int, get(ENV, "FORCE_CPU", "0"))
 const INTERACTIVE = parse(Int, get(ENV, "INTERACTIVE", "0"))
@@ -134,6 +135,35 @@ function resolve_config_stage2(cli::Dict{Symbol, Any})
     return (; data_file, meta_file, checkpoint_file, stage1_ckpt, text, show_ids, force_cpu, interactive, sample)
 end
 
+function resolve_config_joint(cli::Dict{Symbol, Any})
+    checkpoint_file = string(get(cli, :checkpoint_file, CHECKPOINT_FILE))
+    if isempty(checkpoint_file)
+        error("--checkpoint-file is required (or set CHECKPOINT_FILE env)")
+    end
+    if !endswith(checkpoint_file, ".jld2") && isfile(checkpoint_file * ".jld2")
+        checkpoint_file = checkpoint_file * ".jld2"
+    end
+
+    text = string(get(cli, :text, TEXT))
+    text_file = string(get(cli, :text_file, TEXT_FILE))
+    show_ids_raw = string(get(cli, :show_ids, SHOW_IDS))
+    force_cpu_raw = string(get(cli, :force_cpu, FORCE_CPU))
+    interactive_raw = string(get(cli, :interactive, INTERACTIVE))
+    sample_raw = string(get(cli, :sample, SAMPLE))
+    preserve_width_raw = string(get(cli, :preserve_width, PRESERVE_WIDTH))
+    show_ids = show_ids_raw == "true" || show_ids_raw == "1"
+    force_cpu = force_cpu_raw == "true" || force_cpu_raw == "1"
+    interactive = interactive_raw == "true" || interactive_raw == "1"
+    sample = sample_raw == "true" || sample_raw == "1"
+    preserve_width = preserve_width_raw == "true" || preserve_width_raw == "1"
+
+    if !interactive && isempty(text) && isempty(text_file)
+        error("--text or --text-file is required unless --interactive is enabled")
+    end
+
+    return (; checkpoint_file, text, text_file, show_ids, force_cpu, interactive, sample, preserve_width)
+end
+
 function select_device(force_cpu::Bool)
     if force_cpu
         return cpu_device()
@@ -181,6 +211,48 @@ function load_meta(data_file::AbstractString, meta_file::AbstractString)
         length(vocab) - 1
     else
         error("Cannot infer vocab_size from data file")
+    end
+
+    char_map2 = Dict{Char, Int}()
+    if !isempty(char_map)
+        for (k, v) in char_map
+            if k isa Char
+                char_map2[k] = Int(v)
+            elseif k isa AbstractString && ncodeunits(k) > 0
+                char_map2[first(k)] = Int(v)
+            end
+        end
+    end
+
+    id_to_char = Dict{Int, Char}()
+    if !isempty(char_map2)
+        for (c, tid) in char_map2
+            id_to_char[Int(tid)] = c
+        end
+    end
+
+    return (; block_size, vocab_size, pad_id, eos_id, unk_id, char_map=char_map2, id_to_char, vocab)
+end
+
+function load_meta_from_checkpoint(meta_data)
+    params = get(meta_data, "params", nothing)
+    char_map = get(meta_data, "char_map", Dict{Any, Any}())
+    vocab = get(meta_data, "vocab", nothing)
+    params === nothing && error("checkpoint missing meta_data.params")
+
+    block_size = get(params, "BLOCK_SIZE", 8)
+    pad_id = params["PAD"]
+    eos_id = params["EOS"]
+    unk_id = get(params, "UNK", 0)
+
+    vocab_size = if haskey(params, "VOCAB_SIZE")
+        params["VOCAB_SIZE"]
+    elseif !isempty(char_map)
+        length(char_map) + 3
+    elseif vocab !== nothing
+        length(vocab) - 1
+    else
+        error("Cannot infer vocab_size from checkpoint meta_data")
     end
 
     char_map2 = Dict{Char, Int}()
@@ -718,6 +790,165 @@ function infer_stage2(args::Vector{String})
     end
 
     infer_stage2_once(cfg.text, meta, ps2_full, st2_full, decoder_model, ps_dec, st_dec, mixer, reasoner, k_streams, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample)
+    return
+end
+
+function infer_joint_once(text::AbstractString, meta, model, ps, st, mixer, reasoner, k_streams::Int, dev, cpu, rng; show_ids::Bool, sample::Bool, preserve_width::Bool)
+    x = encode_text_to_seq(text, meta; preserve_width=preserve_width)
+    x_dev = x |> dev
+
+    capsules_params, _st_enc = model.encoder(x_dev, ps.model.encoder, st.model.encoder)
+    if capsules_params isa Tuple
+        mu, logvar = capsules_params
+        capsules = sample ? Model.reparameterize(mu, logvar; rng=rng, training=true) : mu
+    else
+        capsules = capsules_params
+    end
+
+    capsules_norm, _st_norm = model.norm(capsules, ps.model.norm, st.model.norm)
+    pred = greedy_decode_capsules(model.decoder, capsules_norm, ps.model.decoder, st.model.decoder, meta, dev, cpu)
+    pred = stop_after_eos(pred, meta.eos_id)
+
+    input_text = decode_ids(vec(x), meta)
+    pred_text = decode_ids(vec(pred), meta)
+
+    println("Input:  ", text)
+    println("Tokens: ", input_text)
+    println("Recons: ", pred_text)
+
+    x_k_unnorm, _st_mix = mixer(capsules_params, k_streams, ps.mixer, st.mixer)
+    x_k_flat = reshape(x_k_unnorm, size(capsules, 1), :)
+    x_k_norm_flat, _st_norm2 = model.norm(x_k_flat, ps.model.norm, st.model.norm)
+    x_k = reshape(x_k_norm_flat, size(capsules, 1), k_streams, size(x_k_unnorm, 3), size(x_k_unnorm, 4))
+    y, _st_reas = reasoner(x_k, ps.reasoner, st.reasoner)
+    y_mean = dropdims(mean(y; dims=2); dims=2)
+
+    if size(y_mean, 2) > 1
+        z_next = @view y_mean[:, 1:end-1, :]
+        pred_next = greedy_decode_capsules(model.decoder, z_next, ps.model.decoder, st.model.decoder, meta, dev, cpu)
+        pred_next = stop_after_eos(pred_next, meta.eos_id)
+        pred_next_text = decode_ids(vec(pred_next), meta)
+        println("PredNext: ", pred_next_text)
+    else
+        println("PredNext: ")
+    end
+
+    if show_ids
+        println("InputIds:")
+        show(stdout, "text/plain", x)
+        println()
+        println("PredIds:")
+        show(stdout, "text/plain", pred)
+        println()
+    end
+    return
+end
+
+function collect_texts(cfg)
+    if cfg.interactive
+        return String[]
+    end
+    texts = String[]
+    if !isempty(cfg.text_file)
+        isfile(cfg.text_file) || error("text file not found: $(cfg.text_file)")
+        for line in eachline(cfg.text_file)
+            s = strip(line)
+            isempty(s) && continue
+            push!(texts, s)
+        end
+    end
+    if !isempty(cfg.text)
+        push!(texts, cfg.text)
+    end
+    isempty(texts) && error("no valid input text found")
+    return texts
+end
+
+function infer_joint(args::Vector{String})
+    if "--help" in args || "-h" in args
+        println("Usage: infer_joint [options]")
+        println("Options:")
+        println("  --checkpoint-file <path>  Joint checkpoint file (REQUIRED)")
+        println("  --text <string>           Text to reconstruct")
+        println("  --text-file <path>        Plain text file, one input per line")
+        println("  --interactive             Interactive mode")
+        println("  --show-ids                Show token IDs")
+        println("  --force-cpu               Force CPU usage")
+        println("  --sample                  Enable VAE resampling")
+        println("  --preserve-width          Keep full-width forms during normalization")
+        return
+    end
+    cli = Utils.parse_cli_args(args)
+    cfg = resolve_config_joint(cli)
+
+    ckpt = JLD2.load(cfg.checkpoint_file)
+    haskey(ckpt, "meta_data") || error("checkpoint missing meta_data")
+    meta = load_meta_from_checkpoint(ckpt["meta_data"])
+    ps = ckpt["ps"]
+    st = ckpt["st"]
+
+    if !(haskey(ps, :model) && haskey(ps, :mixer) && haskey(ps, :reasoner))
+        error("checkpoint is not a joint-format checkpoint")
+    end
+
+    dim = size(ps.model.encoder.embedding.weight, 1)
+    vocab_size = size(ps.model.encoder.embedding.weight, 2)
+    if vocab_size != meta.vocab_size
+        error("Vocab size mismatch: ckpt vocab_size=$(vocab_size) but meta vocab_size=$(meta.vocab_size)")
+    end
+    mamba_d_state = if haskey(ckpt, "mamba_d_state")
+        Int(ckpt["mamba_d_state"])
+    else
+        ds = infer_mamba_d_state_from_ps(ps.model, dim)
+        ds === nothing ? 16 : Int(ds)
+    end
+    k_streams = haskey(ckpt, "k_streams") ? Int(ckpt["k_streams"]) : size(ps.mixer.offsets, 2)
+    heads = haskey(ckpt, "heads") ? Int(ckpt["heads"]) : 8
+    num_layers = haskey(ckpt, "num_layers") ? Int(ckpt["num_layers"]) : 4
+    k_drop_threshold = haskey(ckpt, "k_drop_threshold") ? Float32(ckpt["k_drop_threshold"]) : 0f0
+    k_drop_min = haskey(ckpt, "k_drop_min") ? Int(ckpt["k_drop_min"]) : 1
+
+    model = HMTR_Stage1_AutoEncoder(vocab_size, dim; block_size=meta.block_size, pad_id=meta.pad_id, eos_id=meta.eos_id, mamba_d_state=mamba_d_state)
+    mixer = InitialMixingLayer(dim, k_streams)
+    reasoner = MHCLatentReasoner(dim, k_streams, heads, num_layers; k_drop_threshold=k_drop_threshold, k_drop_min=k_drop_min)
+
+    dev = select_device(cfg.force_cpu)
+    cpu = cpu_device()
+    moved = false
+    if dev !== cpu
+        try
+            ps = ps |> dev
+            st = st |> dev
+            moved = true
+        catch
+            dev = cpu
+        end
+    end
+    if !moved
+        ps = ps |> dev
+        st = st |> dev
+    end
+
+    rng = Random.default_rng()
+    if cfg.interactive
+        while true
+            print("> ")
+            line = readline(stdin; keep=true)
+            s = strip(line)
+            if isempty(s) || s == ":q" || s == "quit" || s == "exit"
+                break
+            end
+            infer_joint_once(s, meta, model, ps, st, mixer, reasoner, k_streams, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, preserve_width=cfg.preserve_width)
+        end
+        return
+    end
+
+    texts = collect_texts(cfg)
+    total = length(texts)
+    for (i, t) in enumerate(texts)
+        println("===== [$i/$total] =====")
+        infer_joint_once(t, meta, model, ps, st, mixer, reasoner, k_streams, dev, cpu, rng; show_ids=cfg.show_ids, sample=cfg.sample, preserve_width=cfg.preserve_width)
+    end
     return
 end
 

@@ -92,6 +92,7 @@ function main(args::AbstractVector{<:AbstractString})
         println("  train_stage_joint (alias: train_joint) - Train unified Stage1+Stage2 objective")
         println("  infer_stage1 (alias: infer) - Run inference/sampling with Stage 1 model")
         println("  infer_stage2               - Run inference with Stage 2 model")
+        println("  infer_joint                - Run inference with joint checkpoint")
         println("  train_stage1_ve (alias: train_ve) - Train the Stage 1 VE AutoEncoder")
         println("  infer_stage1_ve (alias: infer_ve) - Run inference/sampling with VE model")
         println("  data                        - Prepare data (Parquet -> JLD2)")
@@ -113,6 +114,8 @@ function main(args::AbstractVector{<:AbstractString})
         InferStage1.infer_stage1(sub_args)
     elseif command == "infer_stage2"
         InferStage1.infer_stage2(sub_args)
+    elseif command == "infer_joint" || command == "infer_stage_joint"
+        InferStage1.infer_joint(sub_args)
     elseif command == "train_stage2"
         if "--help" in sub_args || "-h" in sub_args
             TrainStage2.train_stage2(sub_args)
@@ -141,7 +144,7 @@ function main(args::AbstractVector{<:AbstractString})
         typecheck_entry(sub_args)
     else
         println("Unknown command: $command")
-        println("Available: train_stage1, train_stage2, train_stage_joint, infer_stage1, infer_stage2, train_stage1_ve, infer_stage1_ve, data, lint, typecheck")
+        println("Available: train_stage1, train_stage2, train_stage_joint, infer_stage1, infer_stage2, infer_joint, train_stage1_ve, infer_stage1_ve, data, lint, typecheck")
         exit(1)
     end
 end
